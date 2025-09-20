@@ -7,10 +7,15 @@ import SignInComponent from "./pages/Login";
 import AboutPage from "./pages/About";
 import FeaturesPage from "./pages/Features";
 import HomePage from "./pages/Home";
+import { useLocation } from 'react-router-dom';
+
 function App() {
+  const location = useLocation();
+  const isDashboard = location.pathname === "/dashboard";
+
   return (
     <>
-      <Header />
+      {!isDashboard && <Header />}
       <Routes>
         <Route path="/dashboard" element={<Dashboard />}></Route>
         <Route path="/signup" element={<SignUpComponent />}></Route>
