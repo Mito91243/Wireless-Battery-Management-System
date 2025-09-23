@@ -3,6 +3,8 @@ import datetime
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from datetime import datetime 
+from fastapi.middleware.cors import CORSMiddleware
+import random
 
 app = FastAPI(title="ESP32 Data Backend", version="1.0.0")
 
@@ -20,6 +22,16 @@ class SensorReading(BaseModel):
     timestamp: str
 
 sensor_readings: List[SensorReading] = []
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or ["http://localhost:3000"] for stricter security
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.get("/")
 async def root():
@@ -57,81 +69,49 @@ async def receive_sensor_data(data: ESP32Data):
         print(f"Error processing data: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/v1/sensor-data/latest")
-async def get_latest_data_per_sensor():
-    if not sensor_readings:
-        return {
-            "status": "success",
-            "message": "No sensor data available",
-            "data": []
-        }
-    
-    latest_readings = {}
-    
-    for reading in sensor_readings:
-        sensor_index = reading.senderIndex
-        if sensor_index not in latest_readings:
-            latest_readings[sensor_index] = reading
-        else:
-            if reading.timestamp > latest_readings[sensor_index].timestamp:
-                latest_readings[sensor_index] = reading
-    
+@app.get("/v1/pack-data/latest")
+async def get_latest_data():
+    battery_packs = []
+
+    for name, pack_id, base_status in [
+        ("Pack Alpha", "BP001", "safe"),
+        ("Pack Beta", "BP002", "caution"),
+    ]:
+        soc = random.randint(50, 100)          # State of charge (50–100%)
+        soh = random.randint(90, 100)          # State of health (90–100%)
+        voltage = round(random.uniform(45.0, 54.0), 2)  # Volts
+        current = round(random.uniform(5.0, 15.0), 2)   # Amps
+        temp = round(random.uniform(25.0, 40.0), 2)     # Celsius
+
+        # 13S4P = 52 cells
+        cells = []
+        for i in range(52):
+            cell_voltage = round(random.uniform(3.2, 4.2), 2)
+            cell_status = "caution" if cell_voltage < 3.3 or cell_voltage > 4.1 else "safe"
+            cells.append({"value": f"{cell_voltage:.2f}", "status": cell_status})
+
+        battery_packs.append({
+            "name": name,
+            "id": pack_id,
+            "status": base_status if random.random() > 0.2 else "caution",  # sometimes flip
+            "soc": soc,
+            "soh": soh,
+            "voltage": str(voltage),
+            "current": str(current),
+            "temp": str(temp),
+            "config": "13S4P (52 cells)",
+            "series": "13",
+            "parallel": "4",
+            "cells": cells
+        })
+
     return {
         "status": "success",
-        "message": f"Latest data for {len(latest_readings)} sensors",
-        "total_sensors": len(latest_readings),
-        "data": list(latest_readings.values())
+        "timestamp": datetime.now().replace(microsecond=0).isoformat(),
+        "packs": battery_packs
     }
 
-@app.get("/v1/sensor-data/sensor/{sensor_index}")
-async def get_data_by_sensor_index(sensor_index: int):
-    """Get all readings for a specific sensor index"""
-    sensor_data = [reading for reading in sensor_readings if reading.senderIndex == sensor_index]
-    
-    if not sensor_data:
-        raise HTTPException(
-            status_code=404, 
-            detail=f"No data found for sensor index {sensor_index}"
-        )
-    
-    return {
-        "status": "success",
-        "message": f"Retrieved {len(sensor_data)} readings for sensor {sensor_index}",
-        "sensor_index": sensor_index,
-        "total_readings": len(sensor_data),
-        "data": sensor_data
-    }
 
-@app.get("/v1/sensor-data/all")
-async def get_all_sensor_data(
-    limit: Optional[int] = Query(None, description="Limit number of results"),
-    offset: Optional[int] = Query(0, description="Offset for pagination")
-):
-    """Get all sensor readings with optional pagination"""
-    if not sensor_readings:
-        return {
-            "status": "success",
-            "message": "No sensor data available",
-            "total_readings": 0,
-            "data": []
-        }
-    
-    start_index = offset
-    if limit:
-        end_index = start_index + limit
-        paginated_data = sensor_readings[start_index:end_index]
-    else:
-        paginated_data = sensor_readings[start_index:]
-    
-    return {
-        "status": "success",
-        "message": f"Retrieved {len(paginated_data)} readings",
-        "total_readings": len(sensor_readings),
-        "returned_readings": len(paginated_data),
-        "offset": offset,
-        "limit": limit,
-        "data": paginated_data
-    }
 
 
 @app.get("/health")
