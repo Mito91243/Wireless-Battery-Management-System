@@ -26,7 +26,7 @@ sensor_readings: List[SensorReading] = []
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or ["http://localhost:3000"] for stricter security
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -64,7 +64,7 @@ async def receive_sensor_data(data: ESP32Data):
             }
 
         }
-    
+
     except Exception as e:
         print(f"Error processing data: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
