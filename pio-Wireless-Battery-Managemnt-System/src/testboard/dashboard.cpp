@@ -24,6 +24,9 @@ uint32_t chargeTime = 0;
 bool isCharging = false;
 bool isDischarging = false;
 bool ledState = false;
+bq_protection_t protStatus;
+bq_temp_t tempStatus;
+uint16_t balancingMask = 0;
 
 unsigned long lastRead = 0;
 const uint32_t READ_INTERVAL_MS = 500;
@@ -95,10 +98,18 @@ void readBMSData()
   charge = bms.getAccumulatedCharge();
   chargeTime = bms.getAccumulatedChargeTime();
 
-  unsigned int fetRaw = bms.directCommandRead(0x7F);
-  addLog(0x7F, fetRaw, false, true);
-  isCharging = (fetRaw & 0x01) != 0;
-  isDischarging = (fetRaw & 0x04) != 0;
+  isCharging = bms.isCharging();
+  isDischarging = bms.isDischarging();
+  addLog(0x7F, (isCharging ? 0x01 : 0) | (isDischarging ? 0x04 : 0), false, true);
+
+  protStatus = bms.getProtectionStatus();
+  addLog(0x03, 0, false, true);
+
+  tempStatus = bms.getTemperatureStatus();
+  addLog(0x05, 0, false, true);
+
+  balancingMask = bms.GetCellBalancingBitmask();
+  addLog(0x83, balancingMask, false, true);
 }
 
 // ==================== HTML PAGE ====================
@@ -244,7 +255,10 @@ button:hover{filter:brightness(0.95)}
         <div style="display:flex;gap:6px"><span class="badge" id="badgeChg">CHG: --</span><span class="badge" id="badgeDsg">DSG: --</span><span class="badge badge-gray badge-outline">ALERT: CLEAR</span></div>
       </div>
       <div><div class="cell-label" style="margin-bottom:4px">PROTECTION FLAGS</div>
-        <div style="display:flex;gap:4px;flex-wrap:wrap"><span class="badge badge-green">OV OK</span><span class="badge badge-green">UV OK</span><span class="badge badge-green">OC OK</span><span class="badge badge-green">SC OK</span><span class="badge badge-green">OT OK</span><span class="badge badge-green">UT OK</span></div>
+        <div style="display:flex;gap:4px;flex-wrap:wrap" id="protFlags"><span class="badge badge-green">OV OK</span><span class="badge badge-green">UV OK</span><span class="badge badge-green">OC OK</span><span class="badge badge-green">SC OK</span><span class="badge badge-green">OT OK</span><span class="badge badge-green">UT OK</span></div>
+      </div>
+      <div style="margin-top:8px"><div class="cell-label" style="margin-bottom:4px">CELL BALANCING</div>
+        <div style="display:flex;gap:4px;flex-wrap:wrap" id="balFlags"></div>
       </div>
     </div>
   </div>
@@ -350,6 +364,11 @@ function updateUI(d){
   document.getElementById('fetDsgToggle').className='toggle '+(d.isDischarging?'on':'off');document.getElementById('fetDsgBadge').textContent=d.isDischarging?'ON':'OFF';document.getElementById('fetDsgBadge').className='badge '+(d.isDischarging?'badge-green':'badge-red');
   document.getElementById('fetWarn').style.display=(!d.isCharging&&!d.isDischarging)?'block':'none';
   document.getElementById('ledIndicator').className='led-indicator '+(ledOn?'on':'off');
+  const pf=document.getElementById('protFlags');
+  const flags=[{k:'prot_ov',l:'OV'},{k:'prot_uv',l:'UV'},{k:'prot_oc1',l:'OC1'},{k:'prot_oc2',l:'OC2'},{k:'prot_occ',l:'OCC'},{k:'prot_sc',l:'SC'},{k:'temp_otf',l:'OT-FET'},{k:'temp_oti',l:'OT-INT'},{k:'temp_otd',l:'OT-DSG'},{k:'temp_otc',l:'OT-CHG'},{k:'temp_uti',l:'UT-INT'},{k:'temp_utd',l:'UT-DSG'},{k:'temp_utc',l:'UT-CHG'}];
+  pf.innerHTML=flags.map(f=>`<span class="badge ${d[f.k]?'badge-red':'badge-green'}">${f.l} ${d[f.k]?'FAULT':'OK'}</span>`).join('');
+  const bf=document.getElementById('balFlags');
+  let bh='';for(let i=0;i<CELLS;i++){const active=(d.balancing>>i)&1;bh+=`<span class="badge ${active?'badge-amber':'badge-gray'}">C${i+1} ${active?'BAL':'--'}</span>`;}bf.innerHTML=bh;
   document.getElementById('sbConn').innerHTML='&#x25CF; Connected';document.getElementById('sbConn').style.color='#16a34a';
   for(let i=0;i<CELLS;i++){vHist[i].push(volts[i]);if(vHist[i].length>HMAX)vHist[i].shift();}
   curHist.push(cur);if(curHist.length>HMAX)curHist.shift();
@@ -382,6 +401,20 @@ void handleApiData()
   json += ",\"isCharging\":" + String(isCharging ? "true" : "false");
   json += ",\"isDischarging\":" + String(isDischarging ? "true" : "false");
   json += ",\"ledState\":" + String(ledState ? "true" : "false");
+  json += ",\"prot_sc\":" + String(protStatus.bits.SC_DCHG ? "true" : "false");
+  json += ",\"prot_oc2\":" + String(protStatus.bits.OC2_DCHG ? "true" : "false");
+  json += ",\"prot_oc1\":" + String(protStatus.bits.OC1_DCHG ? "true" : "false");
+  json += ",\"prot_occ\":" + String(protStatus.bits.OC_CHG ? "true" : "false");
+  json += ",\"prot_ov\":" + String(protStatus.bits.CELL_OV ? "true" : "false");
+  json += ",\"prot_uv\":" + String(protStatus.bits.CELL_UV ? "true" : "false");
+  json += ",\"temp_otf\":" + String(tempStatus.bits.OVERTEMP_FET ? "true" : "false");
+  json += ",\"temp_oti\":" + String(tempStatus.bits.OVERTEMP_INTERNAL ? "true" : "false");
+  json += ",\"temp_otd\":" + String(tempStatus.bits.OVERTEMP_DCHG ? "true" : "false");
+  json += ",\"temp_otc\":" + String(tempStatus.bits.OVERTEMP_CHG ? "true" : "false");
+  json += ",\"temp_uti\":" + String(tempStatus.bits.UNDERTEMP_INTERNAL ? "true" : "false");
+  json += ",\"temp_utd\":" + String(tempStatus.bits.UNDERTEMP_DCHG ? "true" : "false");
+  json += ",\"temp_utc\":" + String(tempStatus.bits.UNDERTEMP_CHG ? "true" : "false");
+  json += ",\"balancing\":" + String(balancingMask);
   json += ",\"txCount\":" + String(txCount) + "}";
   server.send(200, "application/json", json);
 }
@@ -429,6 +462,10 @@ void setup()
   bms.begin(TB_I2C_SDA, TB_I2C_SCL);
   bms.setDebug(true);
   Serial.printf("[TB-Dash] I2C Master SDA=%d SCL=%d\n", TB_I2C_SDA, TB_I2C_SCL);
+
+  // Configure BQ76952 to monitor the correct number of cells
+  bms.setConnectedCells(TB_CONNECTED_CELLS);
+  Serial.printf("[TB-Dash] Configured BQ76952 for %d cells\n", TB_CONNECTED_CELLS);
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(TB_AP_SSID, TB_AP_PASSWORD);
