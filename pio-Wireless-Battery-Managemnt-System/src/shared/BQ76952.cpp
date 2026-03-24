@@ -77,6 +77,22 @@ void BQ76952::reset(void)
   CommandOnlysubCommand(COSCMD_RESET);
 }
 
+void BQ76952::unseal(void)
+{
+  CommandOnlysubCommand(0x0414);
+  delay(10);
+  CommandOnlysubCommand(0x3672);
+  delay(10);
+  debugPrintln(F("[+] UNSEAL sequence sent (0x0414, 0x3672)"));
+}
+
+void BQ76952::seal(void)
+{
+  CommandOnlysubCommand(0x0030); // SEC_SEAL subcommand
+  delay(10);
+  debugPrintln(F("[+] SEAL sequence sent (0x0030)"));
+}
+
 void BQ76952::enterConfigUpdate(void)
 {
   CommandOnlysubCommand(COSCMD_SET_CFGUPDATE);
@@ -217,7 +233,7 @@ bool BQ76952::subCommandWriteData(uint16_t subcmd, const uint8_t *data, uint8_t 
   for (uint8_t i = 0; i < (uint8_t)(len + 2); i++)
     sum += _DataBuffer[i];
   uint8_t checksum = (uint8_t)(~sum);        // same as (0xFF - (sum & 0xFF))
-  uint8_t writelen = (uint8_t)(len + 2 + 2); // "+2" per TI (include subcmd bytes)
+  uint8_t writelen = (uint8_t)(len + 2); // Correct per TI: subcommand bytes + payload bytes
 
   // Write block to 0x3E
   Wire.beginTransmission(BQ_I2C_ADDR);
@@ -434,6 +450,15 @@ void BQ76952::writeFloatToMemory(unsigned int addr, float data)
   writeDataMemory(addr, reinterpret_cast<byte *>(&data), 4);
 }
 
+// Write to a direct command register
+void BQ76952::directCommandWrite(byte command, byte data)
+{
+  Wire.beginTransmission(BQ_I2C_ADDR);
+  Wire.write(command);
+  Wire.write(data);
+  Wire.endTransmission();
+}
+
 // -------------------------------------------------------------------
 // --------------------------- API Functions -------------------------
 // -------------------------------------------------------------------
@@ -541,6 +566,44 @@ uint16_t BQ76952::GetCellBalancingBitmask(void)
   return ((uint16_t)buffer[0]) | ((uint16_t)buffer[1] << 8);
 }
 
+// Sets the bit mask of cells to be balanced (Host-Controlled)
+void BQ76952::setBalancingMask(uint16_t mask)
+{
+  uint8_t data[2];
+  data[0] = (uint8_t)(mask & 0xFF);
+  data[1] = (uint8_t)((mask >> 8) & 0xFF);
+  subCommandWriteData(0x0083, data, 2);
+}
+
+// Returns the Manufacturing Status word (includes SEC and CONFIGUPDATE bits)
+uint16_t BQ76952::getManufacturingStatus(void)
+{
+  uint8_t *buffer = subCommandwithdata(COSCMD_MANUF_STATUS, 2);
+  if (!buffer) return 0;
+  return ((uint16_t)buffer[0]) | ((uint16_t)buffer[1] << 8);
+}
+
+// Sets the device power mode
+void BQ76952::setPowerMode(uint8_t mode)
+{
+  switch (mode)
+  {
+  case 1: // Sleep
+    CommandOnlysubCommand(COSCMD_SLEEP);
+    break;
+  case 2: // Deep Sleep
+    CommandOnlysubCommand(COSCMD_DEEP_SLEEP);
+    break;
+  case 3: // Shutdown
+    CommandOnlysubCommand(COSCMD_SHUTDOWN);
+    break;
+  default: // Normal / Wake
+    // To exit Sleep, usually any I2C activity wakes it.
+    // To exit Deep Sleep, a physical TS2 pulse or RST_SHUT toggle is needed.
+    break;
+  }
+}
+
 // Read cumulative time spent balancing for each cell into a passed buffer
 void BQ76952::GetCellBalancingTimes(uint32_t *Cell_Balance_Times)
 {
@@ -589,31 +652,61 @@ void BQ76952::GetCellBalancingTimes(uint32_t *Cell_Balance_Times)
 
 void BQ76952::setFET(bq76952_fet fet, bq76952_fet_state state)
 {
-  unsigned int subcmd;
+  uint16_t subcmd;
+  uint8_t data[2];
+  bool needsData = false;
+
   switch (state)
   {
   case OFF:
+    needsData = true;
+    data[0] = 0x02; // Force OFF
+    data[1] = 0x00;
     switch (fet)
     {
-    case DCH: // FIX 2: Was 'DCHG' (from thermistor enum, value 4) — never matched
-      subcmd = COSCMD_DSG_PDSG_OFF;
+    case DCH: // Discharge FET
+      subcmd = FET_CTRL_DSG;
       break;
-    case CHG:
-      subcmd = COSCMD_CHG_PCHG_OFF;
+    case CHG: // Charge FET
+      subcmd = FET_CTRL_CHG;
       break;
     default:
+      // For ALL, use command-only version (no data needed)
+      needsData = false;
       subcmd = COSCMD_ALL_FETS_OFF;
       break;
     }
     break;
+
   case ON:
-    // NOTE: BQ76952 has no individual FET-on subcommand.
-    // ALL_FETS_ON (0x0096) is the only option via command-only subcommands.
-    // For selective FET control, use FET_CONTROL (0x0097) via subCommandWriteData().
-    subcmd = COSCMD_ALL_FETS_ON;
+    needsData = true;
+    data[0] = 0x01; // Force ON
+    data[1] = 0x00;
+    switch (fet)
+    {
+    case DCH: // Discharge FET
+      subcmd = FET_CTRL_DSG;
+      break;
+    case CHG: // Charge FET
+      subcmd = FET_CTRL_CHG;
+      break;
+    default:
+      // For ALL, use command-only version (no data needed)
+      needsData = false;
+      subcmd = COSCMD_ALL_FETS_ON;
+      break;
+    }
     break;
   }
-  CommandOnlysubCommand(subcmd);
+
+  if (needsData)
+  {
+    subCommandWriteData(subcmd, data, 2);
+  }
+  else
+  {
+    CommandOnlysubCommand(subcmd);
+  }
 }
 
 // is Charging FET ON?
@@ -684,11 +777,12 @@ float BQ76952::getThermistorTemp(bq76952_thermistor thermistor)
   return (raw - 273.15);
 }
 
-// Check Primary Protection status
+// Check Primary Protection status (Reads Active ALERTS, not latched faults)
 bq_protection_t BQ76952::getProtectionStatus(void)
 {
   bq_protection_t prot;
-  byte regData = (byte)directCommandRead(DIR_CMD_FPROTEC);
+  byte regData = (byte)directCommandRead(DIR_CMD_SAFETY_ALERT_A); // 0x02
+
   prot.bits.SC_DCHG = bitRead(regData, BIT_SA_SC_DCHG);
   prot.bits.OC2_DCHG = bitRead(regData, BIT_SA_OC2_DCHG);
   prot.bits.OC1_DCHG = bitRead(regData, BIT_SA_OC1_DCHG);
@@ -698,11 +792,11 @@ bq_protection_t BQ76952::getProtectionStatus(void)
   return prot;
 }
 
-// Check Temperature Protection status
-bq_temp_t BQ76952::getTemperatureStatus(void)
+// Check Temperature Protection status (Reads Active ALERTS, not latched faults)
+bq_temperature_t BQ76952::getTemperatureStatus(void)
 {
-  bq_temp_t prot;
-  byte regData = (byte)directCommandRead(DIR_CMD_FTEMP);
+  bq_temperature_t prot;
+  byte regData = (byte)directCommandRead(DIR_CMD_SAFETY_ALERT_B); // 0x04
   prot.bits.OVERTEMP_FET = bitRead(regData, BIT_SB_OTF);    // FIX 1: Was BIT_SB_OTC (bit 4), must be BIT_SB_OTF (bit 7)
   prot.bits.OVERTEMP_INTERNAL = bitRead(regData, BIT_SB_OTINT);
   prot.bits.OVERTEMP_DCHG = bitRead(regData, BIT_SB_OTD);
@@ -712,6 +806,18 @@ bq_temp_t BQ76952::getTemperatureStatus(void)
   prot.bits.UNDERTEMP_CHG = bitRead(regData, BIT_SB_UTC);
   return prot;
 }
+
+// Clear all latched Safety Faults
+void BQ76952::clearFaults(void)
+{
+  // Writing 0xFF to the Status registers clears any latched fault bits
+  // This helps recover the BQ76952 from latched states
+  directCommandWrite(DIR_CMD_SAFETY_STATUS_A, 0xFF); // 0x03
+  directCommandWrite(DIR_CMD_SAFETY_STATUS_B, 0xFF); // 0x05
+  directCommandWrite(DIR_CMD_SAFETY_STATUS_C, 0xFF); // 0x07
+  debugPrintln(F("[+] Cleared Latched Safety Faults (0x03, 0x05, 0x07)"));
+}
+
 
 ///// UTILITY FUNCTIONS /////
 
