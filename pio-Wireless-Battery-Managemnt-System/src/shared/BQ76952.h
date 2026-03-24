@@ -26,12 +26,12 @@
 #define CMD_DIR_RESP_CHKSUM 0x60
 
 // BQ76952 - Direct Commands with data
-#define DIR_CMD_SPROTEC 0x02	// Safety Alert A Reg
-#define DIR_CMD_FPROTEC 0x03	// Safety Fault A Reg
-#define DIR_CMD_STEMP 0x04		// Safety Alert B Reg
-#define DIR_CMD_FTEMP 0x05		// Safety Fault B Reg
-#define DIR_CMD_SFET 0x06		// Safety Alert C Reg
-#define DIR_CMD_FFET 0x07		// Safety Fault C Reg
+#define DIR_CMD_SAFETY_ALERT_A 0x02  // Active warnings (Alert A)
+#define DIR_CMD_SAFETY_STATUS_A 0x03 // Latched faults (Status A)
+#define DIR_CMD_SAFETY_ALERT_B 0x04  // Active warnings (Alert B)
+#define DIR_CMD_SAFETY_STATUS_B 0x05 // Latched faults (Status B)
+#define DIR_CMD_SAFETY_ALERT_C 0x06  // Active warnings (Alert C)
+#define DIR_CMD_SAFETY_STATUS_C 0x07 // Latched faults (Status C)
 #define DIR_CMD_BAT_STATUS 0x12 // Battery Status
 #define DIR_CMD_VCELL_1 0x14
 //									 	 |
@@ -48,11 +48,16 @@
 #define COSCMD_SET_CFGUPDATE 0x0090		// Enters config mode
 #define COSCMD_EXIT_CFGUPDATE 0x0092	// Exits config mode
 #define COSCMD_MANUFAC_TOGGLE_FE 0x0022 // Toggles FET manufacture mode
-#define COSCMD_RESET_PASSQ 0x0082		// Resets integrated charge and timer
-#define COSCMD_DSG_PDSG_OFF 0x0093		// Disables DSG and PDSG FET drivers
-#define COSCMD_CHG_PCHG_OFF 0x0094		// Disables CHG and PCHG FET drivers
-#define COSCMD_ALL_FETS_OFF 0x0095		// Disables CHG, DSG, PCHG, and PDSG FET drivers
-#define COSCMD_ALL_FETS_ON 0x0096		// Allows all four FETs to be on if other safety conditions are met
+#define COSCMD_RESET_PASSQ 0x0082		// Resets integrated charge and
+// --- FET Control Subcommands (Requires Data Bytes 0x0001=ON, 0x0002=OFF) ---
+#define FET_CTRL_DSG 0x0093  // Discharge FET control (DSG_PDSG_OFF)
+#define FET_CTRL_CHG 0x0094  // Charge FET control (CHG_PCHG_OFF)
+#define COSCMD_ALL_FETS_OFF 0x0095      // Disables all FET drivers
+#define COSCMD_ALL_FETS_ON 0x0096		// Enables all FET drivers (Allows them to turn on)
+#define COSCMD_SLEEP 0x0011             // Enters Sleep mode
+#define COSCMD_DEEP_SLEEP 0x000F        // Enters Deep Sleep mode
+#define COSCMD_SHUTDOWN 0x0010           // Enters Shutdown mode
+#define COSCMD_MANUF_STATUS 0x0057      // Reads Manufacturing Status (Sealing, Config mode)
 
 // Subcommands with data
 #define DASTATUS_1 0x0071 // simultaneous cell voltage and current ADC counts
@@ -198,7 +203,7 @@ typedef union temperatureProtection
 		uint8_t UNDERTEMP_DCHG : 1;
 		uint8_t UNDERTEMP_CHG : 1;
 	} bits;
-} bq_temp_t;
+} bq_temperature_t; // Renamed from bq_temp_t
 
 class BQ76952
 {
@@ -208,8 +213,11 @@ public:
 	void begin(int SDA_Pin, int SCK_Pin);
 	void setDebug(byte debug);
 	void reset(void);
+	void unseal(void); // Write default keys to unlock SEALED mode
+	void seal(void);   // Re-seal the device
 
 	unsigned int directCommandRead(byte command);
+	void directCommandWrite(byte command, byte data);
 	void CommandOnlysubCommand(unsigned int command);
 	byte *subCommandwithdata(unsigned int command, int bytes_to_read);
 	bool subCommandWriteData(uint16_t subcmd, const uint8_t *data, uint8_t len);
@@ -234,11 +242,18 @@ public:
 	bool isCharging(void);
 	bool isDischarging(void);
 	uint16_t isBalancing(void);
-
+	void setBalancingMask(uint16_t mask);
+	
+	// Power & Status
+	uint16_t getManufacturingStatus(void);
+	void setPowerMode(uint8_t mode); // 0=Normal, 1=Sleep, 2=DeepSleep, 3=Shutdown
+	
 	float getInternalTemp(void);
 	float getThermistorTemp(bq76952_thermistor thermistor);
+	// Safety Status & Faults
 	bq_protection_t getProtectionStatus(void);
-	bq_temp_t getTemperatureStatus(void);
+	bq_temperature_t getTemperatureStatus(void);
+	void clearFaults(void);
 
 	void setDebug(bool);
 	void debugPrint(const char *);
