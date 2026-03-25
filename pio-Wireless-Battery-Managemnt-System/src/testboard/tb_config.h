@@ -17,4 +17,9 @@ const char *const TB_AP_PASSWORD = "wbms1234";
 const int TB_CONNECTED_CELLS = 3;
 const uint32_t TB_UPDATE_INTERVAL_MS = 500;
 
+// ==================== BQ76952 HARDWARE CONTROL PINS ====================
+// Wire: ESP32 GPIO 4 -> BQ76952 CFETOFF, ESP32 GPIO 2 -> BQ76952 DFETOFF
+const int TB_PIN_CFETOFF = 4;  // GPIO 4 -> CFETOFF (Charge FET hardware override)
+const int TB_PIN_DFETOFF = 2;  // GPIO 2 -> DFETOFF (Discharge FET hardware override, also blue LED)
+
 #endif

@@ -16,7 +16,17 @@ void collectBMSData()
 {
   for (int i = 0; i < 16; i++)
   {
-    outgoingData.v[i] = (i < CONNECTED_CELLS) ? bms.getCellVoltage(i + 1) : 0;
+    if (i < CONNECTED_CELLS) {
+      if (i == CONNECTED_CELLS - 1) {
+        // The top cell is always connected to VC16 (Cell 16) in reduced cell configurations
+        outgoingData.v[i] = bms.getCellVoltage(16);
+      } else {
+        // Lower cells are connected sequentially starting from VC1
+        outgoingData.v[i] = bms.getCellVoltage(i + 1);
+      }
+    } else {
+      outgoingData.v[i] = 0;
+    }
   }
   outgoingData.v_stack = bms.getCellVoltage(17);
   outgoingData.v_pack = bms.getCellVoltage(18);
@@ -92,11 +102,12 @@ void setup()
 {
   Serial.begin(115200);
   // BMS init — talks to real BQ76952 (or tb_bq_node simulator) over I2C
+  bms.setDebug(true); // Enable verbose I2C logging for testing read/write
   bms.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   bms.reset();
   delay(100);
   bms.setConnectedCells(CONNECTED_CELLS);
-  // bms.writeByteToMemory(DA_Configuration, 0x06); // uncomment for real BQ76952
+  bms.writeByteToMemory(DA_Configuration, 0x06); // Required for real BQ76952
 
   WiFi.mode(WIFI_STA);
   Serial.printf("[INFO] Sender MAC: %s\n", WiFi.macAddress().c_str());
