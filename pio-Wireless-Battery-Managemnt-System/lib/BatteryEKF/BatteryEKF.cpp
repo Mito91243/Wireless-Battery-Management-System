@@ -366,12 +366,17 @@ void BatteryEKF::update(float current_A, float voltage_V) {
     }
 
     // ========================================================================
+    // ADAPTIVE TUNING
+    // ========================================================================
+    adaptQR(current_A, voltage_error, getSOCUncertainty());
+
+    // ========================================================================
     // PREDICTION STEP
     // ========================================================================
-    
+
     float x_pred[4];
     float F[16];  // Jacobian df/dx
-    
+
     stateTransition(x, current_A, x_pred, F);
     
     // Predict covariance: P_pred = F * P * F' + Q

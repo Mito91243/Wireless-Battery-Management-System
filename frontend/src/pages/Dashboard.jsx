@@ -73,7 +73,7 @@ const ErrorMessage = ({ message }) => (
 );
 
 // Battery Grid Component
-const BatteryGrid = ({ cells }) => {
+const BatteryGrid = ({ cells, config, series, parallel }) => {
   const cellStats = useMemo(() => ({
     safe: cells.filter(c => c.status === 'safe').length,
     caution: cells.filter(c => c.status === 'caution').length,
@@ -92,10 +92,10 @@ const BatteryGrid = ({ cells }) => {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between text-xs text-gray-600">
-        <span>Battery Configuration: 13S4P (52 cells)</span>
-        <span>13 series × 4 parallel</span>
+        <span>Battery Configuration: {config || 'N/A'}</span>
+        <span>{series || '?'} series × {parallel || '?'} parallel</span>
       </div>
-      <div className="grid gap-2" style={{gridTemplateColumns: 'repeat(13, minmax(0, 1fr))'}}>
+      <div className="grid gap-2" style={{gridTemplateColumns: `repeat(${series || 1}, minmax(0, 1fr))`}}>
         {cells.map((cell, index) => (
           <div
             key={index}
@@ -380,7 +380,7 @@ const Dashboard = () => {
           ))}
         </div>
 
-        <BatteryGrid cells={pack.cells} />
+        <BatteryGrid cells={pack.cells} config={pack.config} series={pack.series} parallel={pack.parallel} />
 
         {/* Footer */}
         <div className="flex items-center justify-between pt-4 mt-4 border-t border-gray-200">

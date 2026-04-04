@@ -65,6 +65,7 @@ class PackReading(Base):
     is_charging = Column(Boolean, nullable=False)
     is_discharging = Column(Boolean, nullable=False)
     message = Column(String(50), nullable=True)
+    soc = Column(Float, nullable=True)  # EKF SoC from master ESP32 (%)
 
     pack = relationship("Pack", back_populates="readings")
 

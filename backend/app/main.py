@@ -33,9 +33,9 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 
 # How many cells are connected per slave (from config.h CONNECTED_CELLS)
-CONNECTED_CELLS = int(os.getenv("CONNECTED_CELLS", "13"))
+CONNECTED_CELLS = int(os.getenv("CONNECTED_CELLS", "3"))
 # Pack topology: parallel groups per series cell
-PARALLEL_COUNT = int(os.getenv("PARALLEL_COUNT", "4"))
+PARALLEL_COUNT = int(os.getenv("PARALLEL_COUNT", "1"))
 
 log = logging.getLogger("wbms")
 logging.basicConfig(level=logging.INFO)
@@ -132,6 +132,7 @@ def _on_message(client, userdata, msg):
             is_charging=payload.get("isCharging", False),
             is_discharging=payload.get("isDischarging", False),
             message=payload.get("message", ""),
+            soc=payload.get("soc"),
         )
         db.add(reading)
         db.commit()
@@ -237,7 +238,8 @@ async def get_latest_pack_data(db: Session = Depends(get_db)):
         avg_cell_mv = sum(active_cells) / len(active_cells) if active_cells else 0
         num_series = len(active_cells) if active_cells else CONNECTED_CELLS
 
-        soc = _estimate_soc(avg_cell_mv)
+        # Prefer EKF SoC from the master ESP32; fall back to voltage lookup
+        soc = latest.soc if latest.soc is not None else _estimate_soc(avg_cell_mv)
         status = _compute_status(latest.cell_voltages, latest.chip_temp, latest.temp1)
 
         # Build 13S × 4P cell grid for the frontend.
