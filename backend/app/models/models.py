@@ -1,8 +1,8 @@
-# models.py
-from sqlalchemy import Boolean, Column, Integer, String, Float, DateTime, ForeignKey, Index
+from sqlalchemy import Boolean, Column, Integer, String, Float, DateTime, ForeignKey, Index, JSON
 from sqlalchemy.orm import relationship
-from database import Base
-from datetime import datetime
+from .database import Base
+from datetime import datetime, timezone
+
 
 class User(Base):
     __tablename__ = "users"
@@ -13,80 +13,61 @@ class User(Base):
     email = Column(String(255), unique=True, nullable=False, index=True)
     password = Column(String(255), nullable=False)
 
+
 class Pack(Base):
     __tablename__ = "packs"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(255), unique=True, nullable=False, index=True)
-    
-    # Relationships - One Pack has many Readings and BatteryReadings
+    sender_index = Column(Integer, unique=True, nullable=False)
+
     readings = relationship(
-        "Reading", 
-        back_populates="pack", 
+        "PackReading",
+        back_populates="pack",
         cascade="all, delete-orphan",
-        lazy="dynamic"  # Query on-demand instead of loading all at once
-    )
-    battery_readings = relationship(
-        "BatteryReading", 
-        back_populates="pack", 
-        cascade="all, delete-orphan",
-        lazy="dynamic"
+        lazy="dynamic",
     )
 
-class Reading(Base):
-    __tablename__ = "readings"
+
+class PackReading(Base):
+    """One row per MQTT message — matches the JSON the master publishes."""
+    __tablename__ = "pack_readings"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
-    
-    # Foreign Key to Pack
-    pack_id = Column(
-        Integer, 
-        ForeignKey("packs.id", ondelete="CASCADE", onupdate="CASCADE"), 
-        nullable=False,
-        index=True
+    timestamp = Column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True
     )
-    
-    v_real = Column(Float, nullable=False)
-    current = Column(Float, nullable=False)
-    temperature = Column(Float, nullable=False)
-    cycles = Column(Integer, nullable=False)
-    v_estimated = Column(Float, nullable=False)
-    soc = Column(Float, nullable=False)
-    soh = Column(Float, nullable=False)
-    ekf_soc = Column(Float, nullable=False)
-    power = Column(Float, nullable=True)
-    charging_discharging = Column(Boolean, nullable=True)
-    
-    # Relationship - Many Readings belong to one Pack
+
+    pack_id = Column(
+        Integer,
+        ForeignKey("packs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    sender_index = Column(Integer, nullable=False)
+
+    # Cell voltages stored as JSON list of ints (mV), e.g. [3650, 3700, ...]
+    cell_voltages = Column(JSON, nullable=False)
+
+    v_stack = Column(Integer, nullable=False)   # mV
+    v_pack = Column(Integer, nullable=False)    # mV
+    current = Column(Integer, nullable=False)   # mA (signed)
+
+    chip_temp = Column(Float, nullable=False)   # deg C
+    temp1 = Column(Float, nullable=False)
+    temp2 = Column(Float, nullable=False)
+    temp3 = Column(Float, nullable=False)
+
+    charge = Column(Float, nullable=False)       # Ah
+    charge_time = Column(Integer, nullable=False) # seconds
+
+    is_charging = Column(Boolean, nullable=False)
+    is_discharging = Column(Boolean, nullable=False)
+    message = Column(String(50), nullable=True)
+
     pack = relationship("Pack", back_populates="readings")
-    
-    # Composite index for efficient queries
-    __table_args__ = (
-        Index('idx_pack_timestamp', 'pack_id', 'timestamp'),
-    )
 
-class BatteryReading(Base):
-    __tablename__ = "battery_readings"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    battery_position = Column(Integer, nullable=False)
-    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
-    
-    # Foreign Key to Pack
-    pack_id = Column(
-        Integer, 
-        ForeignKey("packs.id", ondelete="CASCADE", onupdate="CASCADE"), 
-        nullable=False,
-        index=True
-    )
-    
-    voltage = Column(Float, nullable=False)
-    
-    # Relationship - Many BatteryReadings belong to one Pack
-    pack = relationship("Pack", back_populates="battery_readings")
-    
-    # Composite index for efficient queries
     __table_args__ = (
-        Index('idx_pack_battery_timestamp', 'pack_id', 'battery_position', 'timestamp'),
+        Index("idx_pack_timestamp", "pack_id", "timestamp"),
     )

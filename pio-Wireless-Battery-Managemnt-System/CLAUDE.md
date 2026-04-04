@@ -99,7 +99,7 @@ typedef struct {
 
 | Layer | Protocol | Details |
 |-------|----------|---------|
-| BMS IC <-> Slave | I2C | Address `0x08`, pins GPIO 8 (SDA) / GPIO 9 (SCL) — **pins need verification** |
+| BMS IC <-> Slave | I2C | Address `0x08`, pins GPIO 21 (SDA) / GPIO 22 (SCL) |
 | Slave <-> Master | ESP-NOW | MAC-addressed, unencrypted, channel synced to WiFi AP |
 | Master <-> Cloud | MQTT | Broker at `3.110.221.59:1883`, topic `bms/data`, client ID `wbms-master` |
 | Debug | UART | 115200 baud on both nodes |

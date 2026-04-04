@@ -1,11 +1,7 @@
-# init_db.py
-from database import engine, Base
-import models
+from .database import engine, Base
+from . import models  # noqa: F401 — import so models register with Base
 
 def init_database():
-    """Initialize database tables - run this once"""
+    """Create all tables that don't already exist."""
     Base.metadata.create_all(bind=engine)
-    print("✅ Database tables created successfully!")
-
-if __name__ == "__main__":
-    init_database()
+    print("Database tables created successfully!")

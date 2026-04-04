@@ -1,47 +1,52 @@
-# schemas.py (optional but recommended for Pydantic models)
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
+
 
 class UserCreate(BaseModel):
     first_name: str
     last_name: str
-    email: EmailStr
+    email: str
     password: str
+
 
 class UserResponse(BaseModel):
     id: int
     first_name: str
     last_name: str
     email: str
-    
+
     class Config:
         from_attributes = True
 
-class PackCreate(BaseModel):
-    name: str
 
 class PackResponse(BaseModel):
     id: int
     name: str
-    
+    sender_index: int
+
     class Config:
         from_attributes = True
 
-class ReadingCreate(BaseModel):
-    pack_id: int
-    v_real: float
-    current: float
-    temperature: float
-    cycles: int
-    v_estimated: float
-    soc: float
-    soh: float
-    ekf_soc: float
-    power: Optional[float] = None
-    charging_discharging: Optional[bool] = None
 
-class BatteryReadingCreate(BaseModel):
-    battery_position: int
+class PackReadingResponse(BaseModel):
+    id: int
+    timestamp: datetime
     pack_id: int
-    voltage: float
+    sender_index: int
+    cell_voltages: List[int]
+    v_stack: int
+    v_pack: int
+    current: int
+    chip_temp: float
+    temp1: float
+    temp2: float
+    temp3: float
+    charge: float
+    charge_time: int
+    is_charging: bool
+    is_discharging: bool
+    message: Optional[str] = None
+
+    class Config:
+        from_attributes = True

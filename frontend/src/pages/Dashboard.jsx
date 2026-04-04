@@ -2,6 +2,10 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { Battery, Zap, AlertTriangle, Thermometer, Activity, History, Clock, TrendingUp, AlertCircle, ExternalLink, Wifi, Home, BarChart3, RefreshCw } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, ResponsiveContainer, Legend, Tooltip, CartesianGrid } from 'recharts';
 
+// In production (Docker), VITE_API_URL is empty — fetch goes to same origin via Nginx proxy.
+// In dev, it points to the backend directly.
+const API_URL = import.meta.env.VITE_API_URL ?? '';
+
 // Custom Tabs Component
 const TabsContext = React.createContext();
 
@@ -192,7 +196,7 @@ const Dashboard = () => {
   const fetchBatteryData = useCallback(async () => {
     try {
       setError(null);
-      const response = await fetch("http://127.0.0.1:8000/v1/pack-data/latest");
+      const response = await fetch(`${API_URL}/v1/pack-data/latest`);
       
       if (!response.ok) {
         throw new Error(`Failed to fetch: ${response.status}`);
