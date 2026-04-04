@@ -36,6 +36,14 @@ unsigned long lastRead = 0;
 const uint32_t READ_INTERVAL_MS = 500;
 uint32_t txCount = 0;
 
+// ==================== BALANCING STATUS (DIAGNOSTIC) ====================
+bool isHardwareBalancing = false;
+uint32_t cellBalancingTimes[16] = {0};
+uint16_t totalBalancingTime = 0;
+uint16_t cellBalancingDelta = 0;
+uint16_t minCellV = 0;
+uint16_t maxCellV = 0;
+
 // ==================== EKF DATA ====================
 BatteryEKF ekf(1.0f);  // 1 second sample time (was 10s)
 float soc_ekf = 0.0f;
@@ -168,6 +176,7 @@ void addLog(uint8_t reg, uint16_t value, bool isWrite, bool ok)
 void readBMSData()
 {
   unsigned int batStat = bms.directCommandRead(DIR_CMD_BAT_STATUS);
+  isHardwareBalancing = (batStat & 0x0004) != 0;
   // BQ76952 BatStatus register (0x12) per TRM Table 12-17:
   //   Bit 15 = SLEEP (device is presently in SLEEP mode)
   //   Bit 4  = WD (watchdog reset indicator — NOT sleep!)
@@ -183,13 +192,18 @@ void readBMSData()
   }
   if (powerMode == 2) { return; }
 
-  // Latency Fix: ONLY read connected cells (3) instead of 16!
+  minCellV = 65535; maxCellV = 0;
   for (int i = 0; i < TB_CONNECTED_CELLS; i++)
   {
       if (i == TB_CONNECTED_CELLS - 1) cellVoltages[i] = bms.getCellVoltage(16);
       else cellVoltages[i] = bms.getCellVoltage(i + 1);
+      
+      if (cellVoltages[i] > 0 && cellVoltages[i] < minCellV) minCellV = cellVoltages[i];
+      if (cellVoltages[i] > maxCellV) maxCellV = cellVoltages[i];
   }
   for (int i = TB_CONNECTED_CELLS; i < 16; i++) cellVoltages[i] = 0;
+  
+  cellBalancingDelta = (minCellV < 65535) ? (maxCellV - minCellV) : 0;
 
   vStack = bms.getCellVoltage(17);
   vPack = bms.getCellVoltage(18);
@@ -219,6 +233,16 @@ void readBMSData()
   fetEn = (batStat & 0x0800) != 0;
   protStatus = bms.getProtectionStatus();
   tempStatus = bms.getTemperatureStatus();
+  
+  balancingMask = bms.GetCellBalancingBitmask();
+  
+  static unsigned long lastBalTimeRead = 0;
+  if (millis() - lastBalTimeRead > 5000) {
+      byte *buf1 = bms.subCommandwithdata(0x0085, 2); // 0x0085 is CBSTATUS1
+      if (buf1) totalBalancingTime = ((uint16_t)buf1[1] << 8) | buf1[0];
+      bms.GetCellBalancingTimes(cellBalancingTimes);
+      lastBalTimeRead = millis();
+  }
 }
 
 
@@ -368,8 +392,23 @@ button:hover{filter:brightness(0.95)}
       <div><div class="cell-label" style="margin-bottom:4px">PROTECTION FLAGS</div>
         <div style="display:flex;gap:4px;flex-wrap:wrap" id="protFlags"><span class="badge badge-green">OV OK</span><span class="badge badge-green">UV OK</span><span class="badge badge-green">OC OK</span><span class="badge badge-green">SC OK</span><span class="badge badge-green">OT OK</span><span class="badge badge-green">UT OK</span></div>
       </div>
-      <div style="margin-top:8px"><div class="cell-label" style="margin-bottom:4px">CELL BALANCING</div>
-        <div style="display:flex;gap:4px;flex-wrap:wrap" id="balFlags"></div>
+      <div style="margin-top:8px">
+        <div class="cell-label" style="margin-bottom:4px">BALANCING DIAGNOSTICS (HARDWARE: <span id="kVHwBal" style="font-weight:bold;color:#16a34a">--</span>)</div>
+        <div class="g3" style="margin-bottom:6px;gap:6px">
+          <div style="background:#f7f8fa;padding:4px 6px;border-radius:3px"><span style="font-size:9px;color:#9ca3ae">DELTA:</span> <span id="kVBalDelta" style="font-weight:bold">--</span> mV</div>
+          <div style="background:#f7f8fa;padding:4px 6px;border-radius:3px"><span style="font-size:9px;color:#9ca3ae">TIME:</span> <span id="kVBalTime" style="font-weight:bold">--</span> s</div>
+          <div style="background:#f7f8fa;padding:4px 6px;border-radius:3px"><span style="font-size:9px;color:#9ca3ae">MASK:</span> <span id="kVBalMask" style="font-weight:bold">--</span></div>
+        </div>
+        <div class="cell-label" style="margin-bottom:4px">CELL VOLTAGES &amp; BALANCING TIMES</div>
+        <table style="width:100%;border-collapse:collapse;font-size:10px;text-align:left;border:1px solid #e0e3e8">
+          <thead><tr style="background:#f7f8fa;color:#9ca3ae">
+            <th style="padding:2px 4px;border:1px solid #e0e3e8">Cell</th>
+            <th style="padding:2px 4px;border:1px solid #e0e3e8">V (mV)</th>
+            <th style="padding:2px 4px;border:1px solid #e0e3e8">Time (s)</th>
+            <th style="padding:2px 4px;border:1px solid #e0e3e8">Stat</th>
+          </tr></thead>
+          <tbody id="kVCellData"></tbody>
+        </table>
       </div>
     </div>
   </div>
@@ -457,16 +496,33 @@ function updateUI(d){
   const delta=((maxV-minV)*1000).toFixed(0);
   const pack=volts.reduce((a,b)=>a+b,0);
   const soc = d.cc_soc !== undefined ? d.cc_soc : Math.min(100,Math.max(0,((minV-3.0)/(4.2-3.0))*100));
-  let activeBal = "";
+  let hwBal = d.hwBalActive == 1;
+  document.getElementById('kVHwBal').textContent = hwBal ? 'ACTIVE ⚡' : 'IDLE';
+  document.getElementById('kVHwBal').style.color = hwBal ? '#2563eb' : '#9ca3ae';
+  document.getElementById('kVBalDelta').textContent = d.cellDelta || '0';
+  document.getElementById('kVBalTime').textContent = d.balTime || '0';
+  document.getElementById('kVBalMask').textContent = '0x' + (d.bal||0).toString(16).toUpperCase().padStart(4,'0');
+  
+  let cbTimes = d.cellBalTimes || new Array(16).fill(0);
+  let cellHtml = '';
+
   for(let i=0;i<CELLS;i++){
     const isBal = (d.bal & (1 << i)) || (i == CELLS-1 && (d.bal & (1 << 15)));
     document.getElementById('bal'+i).style.display = isBal ? 'block' : 'none';
-    if(isBal) activeBal += `<span class="badge badge-red">CELL ${i+1}</span>`;
     document.getElementById('cv'+i).innerHTML=volts[i].toFixed(3)+'<span class="cell-unit">V</span>';
     document.getElementById('cbox'+i).className='cell-box'+(volts[i]<2.7||volts[i]>4.1?' warn':'');
     document.getElementById('cv'+i).style.color=(volts[i]<2.7||volts[i]>4.1)?'#dc2626':'#1a1d23';
+    
+    let mvv = Math.round(volts[i]*1000);
+    let st = isBal ? '<span style="color:#2563eb;font-weight:bold">⚡ BAL</span>' : 
+             (mvv == d.minV ? '<span style="color:#16a34a">MIN</span>' : 
+             (mvv == d.maxV ? '<span style="color:#d97706">MAX</span>' : ''));
+    cellHtml += '<tr><td style="padding:2px 4px;border:1px solid #e0e3e8">C' + (i+1) + 
+                '</td><td style="padding:2px 4px;border:1px solid #e0e3e8">' + mvv + 
+                '</td><td style="padding:2px 4px;border:1px solid #e0e3e8">' + (cbTimes[i]||0) + 
+                '</td><td style="padding:2px 4px;border:1px solid #e0e3e8">' + st + '</td></tr>';
   }
-  document.getElementById('balFlags').innerHTML = activeBal || '<span class="badge badge-green">NONE</span>';
+  document.getElementById('kVCellData').innerHTML = cellHtml;
   
   // Update Sealing & Power Status
   const sec = (d.manStat >> 4) & 0x03;
@@ -584,7 +640,19 @@ void handleApiData()
   server.sendContent(",\"soc_ekf\":" + String(soc_ekf, 1));
   server.sendContent(",\"soc_uncertainty\":" + String(soc_uncertainty, 2));
   server.sendContent(",\"vErr\":" + String(voltage_error_ekf, 1));
+  
+  server.sendContent(",\"hwBalActive\":" + String(isHardwareBalancing ? 1 : 0));
   server.sendContent(",\"bal\":" + String(balancingMask));
+  server.sendContent(",\"balTime\":" + String(totalBalancingTime));
+  server.sendContent(",\"cellDelta\":" + String(cellBalancingDelta));
+  server.sendContent(",\"minV\":" + String(minCellV));
+  server.sendContent(",\"maxV\":" + String(maxCellV));
+  server.sendContent(",\"cellBalTimes\":[");
+  for (int i = 0; i < 16; i++) {
+    server.sendContent(String(cellBalancingTimes[i]));
+    if (i < 15) server.sendContent(",");
+  }
+  server.sendContent("]");
   server.sendContent(",\"manStat\":" + String(manufStatus));
   server.sendContent(",\"pwr\":" + String(powerMode));
   server.sendContent(",\"txCount\":" + String(txCount));
@@ -802,8 +870,10 @@ void setup()
   delay(50);
   
   // 7.1 Disable Autonomous Balancing to allow Host-Controlled mask (0x0083)
+  // CRITICAL FIX: We must write 0x04 instead of 0x00 so that CB_SLP (Bit 2) remains 1,
+  // allowing host-controlled balancing to execute even when the BQ76952 drifts to SLEEP mode!
   Serial.println("[TB-Dash] Disabling Autonomous Balancing (Host Only Mode)...");
-  bms.writeByteToMemory(0x9335, 0x00); 
+  bms.writeByteToMemory(0x9335, 0x04); 
   delay(50);
 
   // 8. Exit CONFIG_UPDATE mode
