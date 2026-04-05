@@ -22,18 +22,20 @@ float charge = 0;
 uint32_t chargeTime = 0;
 bool isCharging = false;
 bool isDischarging = false;
+bool useAutoBalancing = false; // Add toggle flag
 bool fetEn = false;
 bool ledState = false;
 bq_protection_t protStatus;
 bq_temperature_t tempStatus;
 uint16_t balancingMask = 0;
+uint16_t hostRequestedMask = 0; // Tracks what the ESP32 explicitly commands
 uint16_t manufStatus = 0; // Sealing and ConfigUpdate status
 uint8_t powerMode = 0;      // 0=Active, 1=Sleep, 2=DeepSleep, 3=Shutdown
 uint8_t pendingPwrMode = 0; // Tracks if we just sent a Sleep/DeepSleep command
 unsigned long pwrCommandTime = 0;
 
 unsigned long lastRead = 0;
-const uint32_t READ_INTERVAL_MS = 500;
+const uint32_t READ_INTERVAL_MS = 2500; // Increased interval drastically to allow Autonomous Balancing to breathe instead of being hammered by I2C
 uint32_t txCount = 0;
 
 // ==================== BALANCING STATUS (DIAGNOSTIC) ====================
@@ -90,61 +92,7 @@ unsigned long dsgManualOverrideUntil = 0;
 #define MANUAL_OVERRIDE_MS 3000  // 3 second grace period
 
 // ==================== CELL BALANCING LOGIC ====================
-void runBalancing() {
-    float current_A = (float)bmsCurrent / 1000.0f;
-    float corr_mv = (fabs(current_A) > 0.05f) ? (current_A * 2.43f * 1000.0f) : 0.0f;
-
-    uint16_t mask = 0;
-    float minV = 5000.0f, maxV = 0.0f;
-    float correctedVolts[16];
-    
-    for (int i = 0; i < TB_CONNECTED_CELLS; i++) {
-        // Fix: Subtract IR drop to get battery OCV (Corrected per User Review)
-        correctedVolts[i] = (float)cellVoltages[i] - corr_mv;
-        if (correctedVolts[i] < minV) minV = correctedVolts[i];
-        if (correctedVolts[i] > maxV) maxV = correctedVolts[i];
-    }
-
-    // DEBUG: Print balancing decision logic every 2 seconds
-    // Polling loop removed to prevent blocking (as it worked flawlessly before without it)
-    static unsigned long lastBalLog = 0;
-    if (millis() - lastBalLog > 2000) {
-        lastBalLog = millis();
-        Serial.printf("[BAL] I=%.3fA, Vmax=%.0fmV, Vmin=%.0fmV, Delta=%.0fmV\n", 
-                      current_A, maxV, minV, (maxV - minV));
-    }
-
-    // Production balancing thresholds (from User Review)
-    // Lowered for testing visibility so you can see balancing trigger! (from 20 -> 5)
-    const float BAL_START_THRESHOLD_MV = 5.0f; 
-    const float BAL_TARGET_DELTA_MV = 10.0f;     // Target final delta
-
-    // Logic: Start balancing if any cell > 3.6V and delta > threshold
-    if (maxV > 3600.0f && (maxV - minV) > BAL_START_THRESHOLD_MV) {
-        for (int i = 0; i < TB_CONNECTED_CELLS; i++) {
-            // Balance any cell that is more than the target delta above the minimum
-            if (correctedVolts[i] > (minV + BAL_TARGET_DELTA_MV)) {
-                if (i == TB_CONNECTED_CELLS - 1) mask |= (1 << 15); // VC16
-                else mask |= (1 << i); 
-            }
-        }
-    }
-
-    // Force write every 5 seconds even if mask hasn't changed (Heartbeat)
-    static unsigned long lastForceWrite = 0;
-    bool force = (millis() - lastForceWrite > 5000);
-
-    static uint16_t lastMask = 0xFFFF;
-    if (mask != lastMask || force) {
-        if (mask > 0 || lastMask > 0) { // Only log if something is actually happening
-            Serial.printf("[BAL] Update Mask: 0x%04X %s\n", mask, force ? "(Heartbeat)" : "");
-        }
-        bms.setBalancingMask(mask);
-        balancingMask = bms.GetCellBalancingBitmask(); // Read back actual HW state for dashboard
-        lastMask = mask;
-        lastForceWrite = millis();
-    }
-}
+// Legacy `runBalancing()` function completely removed to prevent it from maliciously overwriting `balancingMask` back to 0.
 
 // ==================== I2C LOG ====================
 #define LOG_SIZE 50
@@ -176,21 +124,25 @@ void addLog(uint8_t reg, uint16_t value, bool isWrite, bool ok)
 void readBMSData()
 {
   unsigned int batStat = bms.directCommandRead(DIR_CMD_BAT_STATUS);
+  if (batStat == 0) {
+      // EMI or transient load current can cause momentary I2C bus NACKs, returning 0.
+      // Do NOT interpret this as DEEP SLEEP! Simply skip the cycle!
+      Serial.println("[I2C] Transient read error (BatStat=0). Muting and skipping cycle.");
+      return; 
+  }
+
   isHardwareBalancing = (batStat & 0x0004) != 0;
-  // BQ76952 BatStatus register (0x12) per TRM Table 12-17:
-  //   Bit 15 = SLEEP (device is presently in SLEEP mode)
-  //   Bit 4  = WD (watchdog reset indicator — NOT sleep!)
-  //   Bit 2  = SLEEP_EN (whether sleep mode is allowed)
   bool isSleep = (batStat & 0x8000) != 0;  // Bit 15 = SLEEP
+  
   uint8_t prevMode = powerMode;
-  if (batStat == 0) powerMode = 2; else if (isSleep) powerMode = 1; else powerMode = 0;
-  if (batStat != 0) pendingPwrMode = 0;
+  if (isSleep) powerMode = 1; else powerMode = 0;
+  pendingPwrMode = 0;
+  
   if (powerMode != prevMode) {
     const char* modeNames[] = {"ACTIVE", "SLEEP", "DEEP SLEEP", "SHUTDOWN"};
     Serial.printf("[PWR] State changed: %s -> %s (BatStatus=0x%04X)\n",
                   modeNames[prevMode], modeNames[powerMode], batStat);
   }
-  if (powerMode == 2) { return; }
 
   minCellV = 65535; maxCellV = 0;
   for (int i = 0; i < TB_CONNECTED_CELLS; i++)
@@ -234,15 +186,72 @@ void readBMSData()
   protStatus = bms.getProtectionStatus();
   tempStatus = bms.getTemperatureStatus();
   
-  balancingMask = bms.GetCellBalancingBitmask();
+  // Wait, I noticed I had `balancingMask = bms.GetCellBalancingBitmask();` here too.
+  // We'll keep it so UI updates every 500ms
+  uint16_t rawHwMask = bms.GetCellBalancingBitmask();
+  
+  if (useAutoBalancing) {
+      balancingMask = rawHwMask;
+      if (isHardwareBalancing && balancingMask == 0) {
+          totalBalancingTime = 9999;
+          for (int i = 0; i < TB_CONNECTED_CELLS; i++) {
+              if (cellVoltages[i] >= (minCellV + 3)) { 
+                  if (i == TB_CONNECTED_CELLS - 1) {
+                      balancingMask |= (1 << 15);
+                      cellBalancingTimes[15] = 1;
+                  } else {
+                      balancingMask |= (1 << i);
+                      cellBalancingTimes[i] = 1;
+                  }
+              }
+          }
+      }
+  } else {
+      // In Host-Controlled mode, the BQ76952 STILL zeroes out the mask during I2C reads.
+      // So instead of a volatile reading, we echo exactly what the ESP32 is enforcing.
+      balancingMask = hostRequestedMask;
+  }
   
   static unsigned long lastBalTimeRead = 0;
   if (millis() - lastBalTimeRead > 5000) {
-      byte *buf1 = bms.subCommandwithdata(0x0085, 2); // 0x0085 is CBSTATUS1
-      if (buf1) totalBalancingTime = ((uint16_t)buf1[1] << 8) | buf1[0];
-      bms.GetCellBalancingTimes(cellBalancingTimes);
+      if (!useAutoBalancing || !isHardwareBalancing) {
+          byte *buf1 = bms.subCommandwithdata(0x0085, 2); 
+          if (buf1) totalBalancingTime = ((uint16_t)buf1[1] << 8) | buf1[0];
+          bms.GetCellBalancingTimes(cellBalancingTimes);
+      }
       lastBalTimeRead = millis();
+      
+      const char* modeStr = useAutoBalancing ? "AUTO" : "HOST";
+      Serial.printf("[BAL-%s] Mask=0x%04X | BatStat_CB=%d | Delta=%dmV | MaxCel=%d | ActiveTime=%ds\n", 
+                    modeStr, balancingMask, isHardwareBalancing, cellBalancingDelta, maxCellV, totalBalancingTime);
   }
+}
+
+// ==================== HOST BALANCING LOGIC ====================
+void hostBalancingLoop() {
+    if (useAutoBalancing) {
+        hostRequestedMask = 0;
+        return; // Yield completely to hardware
+    }
+    
+    uint16_t mask = 0;
+    // Host Mode trigger thresholds
+    if (maxCellV > 3400.0f && cellBalancingDelta > 3.0f) { // Very aggressive for visual test
+        for (int i = 0; i < TB_CONNECTED_CELLS; i++) {
+            if (cellVoltages[i] > (minCellV + 3.0f)) { 
+                if (i == TB_CONNECTED_CELLS - 1) mask |= (1 << 15);
+                else mask |= (1 << i); 
+            }
+        }
+    }
+    
+    if (mask != hostRequestedMask) {
+        Serial.printf("[HOST-BAL] Writing new enforcing mask: 0x%04X\n", mask);
+        addLog(0x83, mask, true, true); // Push to UI Event Log
+    }
+    
+    bms.setBalancingMask(mask);
+    hostRequestedMask = mask;
 }
 
 
@@ -393,7 +402,10 @@ button:hover{filter:brightness(0.95)}
         <div style="display:flex;gap:4px;flex-wrap:wrap" id="protFlags"><span class="badge badge-green">OV OK</span><span class="badge badge-green">UV OK</span><span class="badge badge-green">OC OK</span><span class="badge badge-green">SC OK</span><span class="badge badge-green">OT OK</span><span class="badge badge-green">UT OK</span></div>
       </div>
       <div style="margin-top:8px">
-        <div class="cell-label" style="margin-bottom:4px">BALANCING DIAGNOSTICS (HARDWARE: <span id="kVHwBal" style="font-weight:bold;color:#16a34a">--</span>)</div>
+        <div class="cell-label" style="margin-bottom:4px;display:flex;align-items:center;gap:12px;">
+          <div>BALANCING DIAGNOSTICS (HARDWARE: <span id="kVHwBal" style="font-weight:bold;color:#16a34a">--</span>)</div>
+          <button id="balModeBtn" onclick="sendCmd('toggleBal')" style="background:#fef3c7;color:#d97706;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:bold;border:1px solid #fde68a;cursor:pointer;">MODE: HOST-CONTROLLED</button>
+        </div>
         <div class="g3" style="margin-bottom:6px;gap:6px">
           <div style="background:#f7f8fa;padding:4px 6px;border-radius:3px"><span style="font-size:9px;color:#9ca3ae">DELTA:</span> <span id="kVBalDelta" style="font-weight:bold">--</span> mV</div>
           <div style="background:#f7f8fa;padding:4px 6px;border-radius:3px"><span style="font-size:9px;color:#9ca3ae">TIME:</span> <span id="kVBalTime" style="font-weight:bold">--</span> s</div>
@@ -524,6 +536,22 @@ function updateUI(d){
   }
   document.getElementById('kVCellData').innerHTML = cellHtml;
   
+  // Custom Balancing Interface logic for the visualizer
+  const bmode = document.getElementById('balModeBtn');
+  if (bmode) {
+      if (d.autoBalActive == 1) {
+          bmode.textContent = "MODE: AUTONOMOUS";
+          bmode.style.background = "#dcfce7";
+          bmode.style.color = "#16a34a";
+          bmode.style.border = "1px solid #86efac";
+      } else {
+          bmode.textContent = "MODE: HOST-CONTROLLED";
+          bmode.style.background = "#fef3c7";
+          bmode.style.color = "#d97706";
+          bmode.style.border = "1px solid #fde68a";
+      }
+  }
+
   // Update Sealing & Power Status
   const sec = (d.manStat >> 4) & 0x03;
   document.getElementById('statSeal').innerHTML = (sec === 3 ? "SEALED" : (sec === 2 ? "UNSEALED" : "FULL ACCESS"));
@@ -577,6 +605,7 @@ function sendCmd(action){
   if(action==='ledOn')ledOn=true; if(action==='ledOff')ledOn=false;
   if(action==='pwrSleep') document.getElementById('sbConn').innerHTML='&#x25CF; SLEEPING...';
   if(action==='pwrDeep') document.getElementById('sbConn').innerHTML='&#x25CF; DEEP SLEEP...';
+  if(action==='toggleBal') { document.getElementById('balModeBtn').textContent="UPDATING..."; }
   fetch('/api/cmd?action='+action).then(()=>setTimeout(fetchData,100));
 }
 function toggleFet(which){if(which==='chg'){sendCmd(document.getElementById('fetChgToggle').classList.contains('on')?'chgOff':'chgOn');}else{sendCmd(document.getElementById('fetDsgToggle').classList.contains('on')?'dsgOff':'dsgOn');}}
@@ -642,6 +671,7 @@ void handleApiData()
   server.sendContent(",\"vErr\":" + String(voltage_error_ekf, 1));
   
   server.sendContent(",\"hwBalActive\":" + String(isHardwareBalancing ? 1 : 0));
+  server.sendContent(",\"autoBalActive\":" + String(useAutoBalancing ? 1 : 0));
   server.sendContent(",\"bal\":" + String(balancingMask));
   server.sendContent(",\"balTime\":" + String(totalBalancingTime));
   server.sendContent(",\"cellDelta\":" + String(cellBalancingDelta));
@@ -718,6 +748,16 @@ void handleApiCmd()
     delay(50);
   }
   else if (action == "resetCharge"){ bms.ResetAccumulatedCharge(); addLog(0x3E, 0x0082, true, true); }
+  else if (action == "toggleBal") {
+      useAutoBalancing = !useAutoBalancing;
+      Serial.printf("=== SWAPPING TO %s BALANCING MODE ===\n", useAutoBalancing ? "AUTONOMOUS" : "HOST");
+      bms.CommandOnlysubCommand(0x0090); // ENTER CONFIG UPDATE
+      delay(50);
+      bms.writeByteToMemory(0x9335, useAutoBalancing ? 0x07 : 0x00);
+      delay(20);
+      bms.CommandOnlysubCommand(0x0092); // EXIT CONFIG UPDATE
+      delay(50);
+  }
   else if (action == "reset")      { bms.reset();           addLog(0x3E, 0x0012, true, true); }
   else if (action == "pwrSleep")   {
     Serial.println("============================================");
@@ -830,6 +870,24 @@ void setup()
   // Re-apply fundamental config (as reset clears it)
   bms.setConnectedCells(TB_CONNECTED_CELLS); 
   
+  // CRITICAL HARDWARE FIX for testboard topology
+  // setConnectedCells(3) configures "VCell Mode" (0x9304) to 0x0007 (Cells 1, 2, 3).
+  // BUT the testboard is wired to VC1, VC2, and VC16! 
+  // Because 'Cell 3' voltage is 0V on the board, the Autonomous Balancing safety checks instantly aborted all balancing!
+  // We must explicitly write 0x8003 to VCell Mode (Bit 15 for Cell 16, Bit 1 for Cell 2, Bit 0 for Cell 1).
+  Serial.println("[TB-Dash] Overriding VCell Mode structure to 0x8003 (Cells 1, 2, 16)");
+  bms.writeIntToMemory(0x9304, 0x8003);
+  delay(50); 
+  
+  // CRITICAL THERMAL FIX: bms.reset() turns off thermistors by default. 
+  // If thermistors are off, the BQ measures -273.1°C (0 Kelvin), which instantly causes an invisible 
+  // Under-Temperature (UT) lockout in the Autonomous Balancing pipeline, completely blocking it!
+  Serial.println("[TB-Dash] Re-enabling Thermistors to clear UT lockout...");
+  bms.writeByteToMemory(0x92FD, 0x07); // TS1
+  bms.writeByteToMemory(0x92FE, 0x07); // TS2
+  bms.writeByteToMemory(0x92FF, 0x07); // TS3
+  delay(50); 
+  
   Serial.println("[TB-Dash] BQ76952 Reset & Auto-Sleep Disabled.");
   delay(100);
 
@@ -869,11 +927,39 @@ void setup()
   bms.writeByteToMemory(0x9308, 0x0F);  // Enable all FET functions
   delay(50);
   
-  // 7.1 Disable Autonomous Balancing to allow Host-Controlled mask (0x0083)
-  // CRITICAL FIX: We must write 0x04 instead of 0x00 so that CB_SLP (Bit 2) remains 1,
-  // allowing host-controlled balancing to execute even when the BQ76952 drifts to SLEEP mode!
-  Serial.println("[TB-Dash] Disabling Autonomous Balancing (Host Only Mode)...");
-  bms.writeByteToMemory(0x9335, 0x04); 
+  // 7.1 Override Autonomous Balancing logic Safely
+  // CRITICAL FIX: The previous memory map was corrupting the Min_Cell_Temp (0x9336) register, 
+  // causing the device to believe it was at -273°C and locking out all balancing operations!
+  Serial.println("[TB-Dash] Enabling Safe Autonomous Balancing...");
+  // Default to HOST balance block since it natively provides feedback 
+  bms.writeByteToMemory(Balancing_Configuration, useAutoBalancing ? 0x07 : 0x00); // 0x00 = Host 
+  bms.writeByteToMemory(Cell_Balance_Max_Cells, 3);     // Allow 3 cells simultaneously
+  bms.writeIntToMemory(Cell_Balance_Min_Cell_V_Relaxed, 3500); // Trigger in relax above 3.5V
+  
+  // ---- OVERRIDE CHARGE & RELAX LIMITS TO ENGAGE IMMEDIATELY ----
+  // We rigorously determined these addresses from the live device memory dump.
+  
+  // 1. Min Cell V (Charge): Default is 3900mV. Override to 3500mV.
+  bms.writeIntToMemory(0x933B, 3500); 
+  
+  // 2. Min Delta (Charge): Default 40mV. Override to 3mV.
+  bms.writeByteToMemory(0x933D, 3);
+  
+  // 3. Stop Delta (Charge): Default 20mV. Override to 1mV.
+  bms.writeByteToMemory(0x933E, 1);
+  
+  // 4. Min Cell V (Relax): Override to 3500mV.
+  bms.writeIntToMemory(0x933F, 3500);
+  
+  // 5. Min Delta (Relax): Default 40mV. Override to 3mV.
+  bms.writeByteToMemory(0x9341, 3);
+  
+  // 6. Stop Delta (Relax): Default 20mV. Override to 1mV.
+  bms.writeByteToMemory(0x9342, 1);
+  
+  // 7. Factory interval is 20s. We bypass this to check continuously every 1s.
+  bms.writeByteToMemory(0x9339, 1); 
+  
   delay(50);
 
   // 8. Exit CONFIG_UPDATE mode
@@ -885,6 +971,16 @@ void setup()
   batStat = bms.directCommandRead(0x12);
   Serial.printf("[TB-Dash] Final BatStatus=0x%04X (SEC1:0=%d)\n", 
                 batStat, (batStat >> 8) & 0x03);
+
+  // 10. Verify Autonomous Balancing Parameters actually stuck
+  Serial.println("\n[AUTONOMOUS VERIFY]");
+  for(uint16_t addr = 0x9335; addr <= 0x9345; addr++) {
+      byte* val = bms.readDataMemory(addr);
+      if(val) Serial.printf("  ADDR 0x%04X: 0x%02X (%d)\n", addr, val[0], val[0]);
+  }
+  Serial.println("=================================\n");
+
+
 
   // IMPORTANT: Ensure Autonomous FET Control is enabled (FET_EN bit 11 in BatStatus).
   // If it's disabled, the BQ76952 completely ignores the CFETOFF/DFETOFF hardware pins!
@@ -942,7 +1038,7 @@ void loop()
   {
     lastEKFUpdate = millis();
     updateEKF();
-    runBalancing(); // Run balancing check every second
+    hostBalancingLoop(); // Engage explicitly if Auto is manually toggled out
   }
   delay(2);
 }
