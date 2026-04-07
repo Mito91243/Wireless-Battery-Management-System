@@ -23,11 +23,13 @@ uint32_t chargeTime = 0;
 bool isCharging = false;
 bool isDischarging = false;
 bool useAutoBalancing = false; // Add toggle flag
+bool balancingEnabled = true; // Master toggle to enable/disable ANY balancing
 bool fetEn = false;
 bool ledState = false;
 bq_protection_t protStatus;
 bq_temperature_t tempStatus;
 uint16_t balancingMask = 0;
+uint16_t lastFetStat = 0; // Cached FET_Status register (0x7F) for API access
 uint16_t hostRequestedMask = 0; // Tracks what the ESP32 explicitly commands
 uint16_t manufStatus = 0; // Sealing and ConfigUpdate status
 uint8_t powerMode = 0;      // 0=Active, 1=Sleep, 2=DeepSleep, 3=Shutdown
@@ -42,6 +44,7 @@ uint32_t txCount = 0;
 bool isHardwareBalancing = false;
 uint32_t cellBalancingTimes[16] = {0};
 uint16_t totalBalancingTime = 0;
+uint16_t hwBalancingTime = 0; // Direct read from BQ76952 CB Active Time (0x0085) — evidence of real HW balancing
 uint16_t cellBalancingDelta = 0;
 uint16_t minCellV = 0;
 uint16_t maxCellV = 0;
@@ -56,6 +59,12 @@ float software_charge_Ah = 0.0f; // Accurate CC integration
 unsigned long last_cc_update = 0;
 unsigned long lastEKFUpdate = 0;
 const unsigned long EKF_UPDATE_INTERVAL = 1000; // 1 second update (was 10s)
+
+// ==================== PERFORMANCE PROFILING ====================
+uint32_t perf_i2c_us = 0;
+uint32_t perf_ekf_us = 0;
+uint32_t perf_web_us = 0; 
+uint32_t web_peak_us = 0;
 
 // Helper function for smart SOC initialization
 float smartSOCInit(float V_measured, float I_current) {
@@ -165,7 +174,7 @@ void readBMSData()
   temp2 = bms.getThermistorTemp(TS2);
   temp3 = bms.getThermistorTemp(TS3);
 
-  charge = bms.getAccumulatedCharge();
+  // We only pull the Coulomb Counter data every 30s to avoid sending subcommands
   unsigned long now_cc = millis();
   if (last_cc_update != 0) {
       float dt_h = (now_cc - last_cc_update) / 3600000.0f;
@@ -173,70 +182,78 @@ void readBMSData()
       software_charge_Ah += ((float)bmsCurrent / 1000.0f) * dt_h;
   }
   last_cc_update = now_cc;
-  chargeTime = bms.getAccumulatedChargeTime();
   
   // RESTORED DEBUG LOG: Print real BQ76952 hardware state every poll cycle
   uint16_t fetStat = bms.directCommandRead(0x7F);
-  Serial.printf("[DEBUG] BatStat=0x%04X FET_Stat=0x%02X | CHG=%d DSG=%d | CFETOFF_pin=%d DFETOFF_pin=%d\n",
+  lastFetStat = fetStat; // Cache for API access
+  // Bits 5,4 = DDSG,DCHG pin state from BQ76952 silicon (true hardware reading)
+  int ddsgHw = (fetStat & 0x20) ? 1 : 0; // Bit 5 = DDSG
+  int dchgHw = (fetStat & 0x10) ? 1 : 0; // Bit 4 = DCHG
+  Serial.printf("[DEBUG] BatStat=0x%04X FET_Stat=0x%02X | CHG=%d DSG=%d | CFETOFF=%d DFETOFF=%d | DDSG=%d DCHG=%d\n",
                 batStat, fetStat,
                 (fetStat & 0x01) ? 1 : 0, (fetStat & 0x04) ? 1 : 0,
-                digitalRead(TB_PIN_CFETOFF), digitalRead(TB_PIN_DFETOFF));
+                digitalRead(TB_PIN_CFETOFF), digitalRead(TB_PIN_DFETOFF),
+                ddsgHw, dchgHw);
 
   fetEn = (batStat & 0x0800) != 0;
   protStatus = bms.getProtectionStatus();
   tempStatus = bms.getTemperatureStatus();
   
-  // Wait, I noticed I had `balancingMask = bms.GetCellBalancingBitmask();` here too.
-  // We'll keep it so UI updates every 500ms
+  // ==================== I2C POLLING FOR BALANCING ====================
+  charge = bms.getAccumulatedCharge();
+  chargeTime = bms.getAccumulatedChargeTime();
   uint16_t rawHwMask = bms.GetCellBalancingBitmask();
   
-  if (useAutoBalancing) {
+  const char* modeStr = useAutoBalancing ? "AUTO" : "HOST";
+  Serial.printf("[BAL-%s] SW_Timer=%ds | Mask=0x%04X | BatStat_CB=%d | Delta=%dmV\n",
+                modeStr, totalBalancingTime, balancingMask, isHardwareBalancing, cellBalancingDelta);
+  
+  if (!balancingEnabled) {
+      balancingMask = 0; // Absolute UI override to prevent flickering while BQ shuts down
+  } else if (useAutoBalancing) {
       balancingMask = rawHwMask;
+      // Synthesize display mask purely based on active state, so it never flickers.
       if (isHardwareBalancing && balancingMask == 0) {
-          totalBalancingTime = 9999;
           for (int i = 0; i < TB_CONNECTED_CELLS; i++) {
               if (cellVoltages[i] >= (minCellV + 3)) { 
-                  if (i == TB_CONNECTED_CELLS - 1) {
-                      balancingMask |= (1 << 15);
-                      cellBalancingTimes[15] = 1;
-                  } else {
-                      balancingMask |= (1 << i);
-                      cellBalancingTimes[i] = 1;
-                  }
+                  if (i == TB_CONNECTED_CELLS - 1) balancingMask |= (1 << 15);
+                  else balancingMask |= (1 << i);
               }
           }
       }
   } else {
-      // In Host-Controlled mode, the BQ76952 STILL zeroes out the mask during I2C reads.
-      // So instead of a volatile reading, we echo exactly what the ESP32 is enforcing.
       balancingMask = hostRequestedMask;
-  }
-  
-  static unsigned long lastBalTimeRead = 0;
-  if (millis() - lastBalTimeRead > 5000) {
-      if (!useAutoBalancing || !isHardwareBalancing) {
-          byte *buf1 = bms.subCommandwithdata(0x0085, 2); 
-          if (buf1) totalBalancingTime = ((uint16_t)buf1[1] << 8) | buf1[0];
-          bms.GetCellBalancingTimes(cellBalancingTimes);
-      }
-      lastBalTimeRead = millis();
-      
-      const char* modeStr = useAutoBalancing ? "AUTO" : "HOST";
-      Serial.printf("[BAL-%s] Mask=0x%04X | BatStat_CB=%d | Delta=%dmV | MaxCel=%d | ActiveTime=%ds\n", 
-                    modeStr, balancingMask, isHardwareBalancing, cellBalancingDelta, maxCellV, totalBalancingTime);
   }
 }
 
 // ==================== HOST BALANCING LOGIC ====================
 void hostBalancingLoop() {
-    if (useAutoBalancing) {
+    uint16_t mask = balancingMask; // Initialize with whatever is actively showing
+    
+    if (!balancingEnabled) {
         hostRequestedMask = 0;
-        return; // Yield completely to hardware
+        balancingMask = 0;
+        // If the silicon still reports active balancing after we turned off the master, forcefully kill it.
+        // This solves the race condition where BQ76952 ignores the 0-mask sent during config exit.
+        if (isHardwareBalancing) {
+            bms.setBalancingMask(0);
+        }
+        return; // Complete halt on balancing logic
     }
     
-    uint16_t mask = 0;
-    // Host Mode trigger thresholds
-    if (maxCellV > 3400.0f && cellBalancingDelta > 3.0f) { // Very aggressive for visual test
+    if (useAutoBalancing) {
+        hostRequestedMask = 0; 
+        // We do purely time monitoring here since HW governs FETs
+        if (mask > 0) totalBalancingTime += 1;
+        for (int i = 0; i < 16; i++) {
+            if (mask & (1 << i)) cellBalancingTimes[i] += 1;
+        }
+        return; 
+    }
+    
+    // ----- HOST OVERRIDE MODE ENGINE -----
+    mask = 0;
+    if (maxCellV > 3400.0f && cellBalancingDelta > 3.0f) { 
         for (int i = 0; i < TB_CONNECTED_CELLS; i++) {
             if (cellVoltages[i] > (minCellV + 3.0f)) { 
                 if (i == TB_CONNECTED_CELLS - 1) mask |= (1 << 15);
@@ -250,8 +267,14 @@ void hostBalancingLoop() {
         addLog(0x83, mask, true, true); // Push to UI Event Log
     }
     
+    if (mask > 0) totalBalancingTime += 1;
+    for (int i = 0; i < 16; i++) {
+        if (mask & (1 << i)) cellBalancingTimes[i] += 1;
+    }
+    
     bms.setBalancingMask(mask);
     hostRequestedMask = mask;
+    balancingMask = mask; // Echo immediately to internal var so UI catches it instantly!
 }
 
 
@@ -396,19 +419,20 @@ button:hover{filter:brightness(0.95)}
     <div class="card-head"><h2>Safety &amp; Protection</h2><div class="desc">FET status and active fault flags</div></div>
     <div class="card-body">
       <div style="margin-bottom:10px"><div class="cell-label" style="margin-bottom:4px">FET STATUS</div>
-        <div style="display:flex;gap:6px"><span class="badge" id="badgeChg">CHG: --</span><span class="badge" id="badgeDsg">DSG: --</span><span class="badge badge-gray badge-outline">ALERT: CLEAR</span></div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap"><span class="badge" id="badgeChg">CHG: --</span><span class="badge" id="badgeDsg">DSG: --</span><span class="badge badge-gray badge-outline">ALERT: CLEAR</span><span class="badge" id="badgeDDSG" style="background:#f3f4f6;color:#9ca3ae">DDSG: --</span><span class="badge" id="badgeDCHG" style="background:#f3f4f6;color:#9ca3ae">DCHG: --</span></div>
       </div>
       <div><div class="cell-label" style="margin-bottom:4px">PROTECTION FLAGS</div>
         <div style="display:flex;gap:4px;flex-wrap:wrap" id="protFlags"><span class="badge badge-green">OV OK</span><span class="badge badge-green">UV OK</span><span class="badge badge-green">OC OK</span><span class="badge badge-green">SC OK</span><span class="badge badge-green">OT OK</span><span class="badge badge-green">UT OK</span></div>
       </div>
       <div style="margin-top:8px">
-        <div class="cell-label" style="margin-bottom:4px;display:flex;align-items:center;gap:12px;">
-          <div>BALANCING DIAGNOSTICS (HARDWARE: <span id="kVHwBal" style="font-weight:bold;color:#16a34a">--</span>)</div>
-          <button id="balModeBtn" onclick="sendCmd('toggleBal')" style="background:#fef3c7;color:#d97706;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:bold;border:1px solid #fde68a;cursor:pointer;">MODE: HOST-CONTROLLED</button>
+        <div class="cell-label" style="margin-bottom:4px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          <div>BALANCING DIAGNOSTICS</div>
+          <button id="balModeBtn" onclick="sendCmd('toggleBal')" style="background:#fef3c7;color:#d97706;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:bold;border:1px solid #fde68a;cursor:pointer;margin-left:auto;">MODE: ...</button>
+          <button id="balMasterBtn" onclick="sendCmd('toggleBalMaster')" style="background:#dcfce7;color:#16a34a;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:bold;border:1px solid #bbf7d0;cursor:pointer;">MASTER: ON</button>
         </div>
-        <div class="g3" style="margin-bottom:6px;gap:6px">
+        <div class="g4" style="margin-bottom:6px;gap:6px">
           <div style="background:#f7f8fa;padding:4px 6px;border-radius:3px"><span style="font-size:9px;color:#9ca3ae">DELTA:</span> <span id="kVBalDelta" style="font-weight:bold">--</span> mV</div>
-          <div style="background:#f7f8fa;padding:4px 6px;border-radius:3px"><span style="font-size:9px;color:#9ca3ae">TIME:</span> <span id="kVBalTime" style="font-weight:bold">--</span> s</div>
+          <div style="background:#f7f8fa;padding:4px 6px;border-radius:3px"><span style="font-size:9px;color:#9ca3ae">SW TIME:</span> <span id="kVBalTime" style="font-weight:bold">--</span> s</div>
           <div style="background:#f7f8fa;padding:4px 6px;border-radius:3px"><span style="font-size:9px;color:#9ca3ae">MASK:</span> <span id="kVBalMask" style="font-weight:bold">--</span></div>
         </div>
         <div class="cell-label" style="margin-bottom:4px">CELL VOLTAGES &amp; BALANCING TIMES</div>
@@ -417,6 +441,7 @@ button:hover{filter:brightness(0.95)}
             <th style="padding:2px 4px;border:1px solid #e0e3e8">Cell</th>
             <th style="padding:2px 4px;border:1px solid #e0e3e8">V (mV)</th>
             <th style="padding:2px 4px;border:1px solid #e0e3e8">Time (s)</th>
+            <th style="padding:2px 4px;border:1px solid #e0e3e8">Bled</th>
             <th style="padding:2px 4px;border:1px solid #e0e3e8">Stat</th>
           </tr></thead>
           <tbody id="kVCellData"></tbody>
@@ -466,6 +491,18 @@ button:hover{filter:brightness(0.95)}
         </div>
       </div>
     </div>
+    <div class="card">
+      <div class="card-head"><h2>Performance Monitor</h2><div class="desc">ESP32 Core 1 RT latency tracking</div></div>
+      <div class="card-body">
+        <svg id="chartPerf" viewBox="0 0 700 80" style="width:100%;display:block;background:#f7f8fa;border-radius:3px;margin-bottom:8px"></svg>
+        <div style="font-size:10px;text-align:center;font-weight:600;color:#5f6672;margin-bottom:8px;letter-spacing:0.5px">TOTAL CORE LOAD: <span id="vTotalLoad" style="color:#2563eb;font-weight:bold;font-size:11px">--</span></div>
+        <div class="fet-row"><div><div style="font-size:11px;font-weight:500">I2C Polling</div></div><div style="font-family:monospace;font-size:11px;color:#d97706" id="perfI2C">-- ms</div></div>
+        <div class="fet-row"><div><div style="font-size:11px;font-weight:500">EKF + NN Core</div></div><div style="font-family:monospace;font-size:11px;color:#16a34a" id="perfEKF">-- ms</div></div>
+        <div class="fet-row"><div><div style="font-size:11px;font-weight:500">Web Dashboard API</div></div><div style="font-family:monospace;font-size:11px;color:#2563eb" id="perfWeb">-- ms</div></div>
+      </div>
+    </div>
+  </div>
+</div>
 <div id="plotsTab" style="display:none">
   <div style="display:flex;gap:6px;align-items:center;margin-bottom:12px"><span style="font-size:10px;color:#9ca3ae;font-weight:500">Window:</span><button class="btn sm active">60s</button><button class="btn sm">5min</button></div>
   <div class="chart-wrap"><svg id="chartVoltage" viewBox="0 0 700 200" style="width:100%;display:block"></svg></div>
@@ -508,9 +545,18 @@ function updateUI(d){
   const delta=((maxV-minV)*1000).toFixed(0);
   const pack=volts.reduce((a,b)=>a+b,0);
   const soc = d.cc_soc !== undefined ? d.cc_soc : Math.min(100,Math.max(0,((minV-3.0)/(4.2-3.0))*100));
-  let hwBal = d.hwBalActive == 1;
-  document.getElementById('kVHwBal').textContent = hwBal ? 'ACTIVE ⚡' : 'IDLE';
-  document.getElementById('kVHwBal').style.color = hwBal ? '#2563eb' : '#9ca3ae';
+  
+  const mbBtn = document.getElementById('balMasterBtn');
+  if (mbBtn && d.balMaster !== undefined) {
+      if (d.balMaster) {
+          mbBtn.textContent = 'MASTER: ON';
+          mbBtn.style.color = '#16a34a'; mbBtn.style.background = '#dcfce7'; mbBtn.style.borderColor = '#bbf7d0';
+      } else {
+          mbBtn.textContent = 'MASTER: OFF';
+          mbBtn.style.color = '#dc2626'; mbBtn.style.background = '#fee2e2'; mbBtn.style.borderColor = '#fecaca';
+      }
+  }
+  
   document.getElementById('kVBalDelta').textContent = d.cellDelta || '0';
   document.getElementById('kVBalTime').textContent = d.balTime || '0';
   document.getElementById('kVBalMask').textContent = '0x' + (d.bal||0).toString(16).toUpperCase().padStart(4,'0');
@@ -529,9 +575,14 @@ function updateUI(d){
     let st = isBal ? '<span style="color:#2563eb;font-weight:bold">⚡ BAL</span>' : 
              (mvv == d.minV ? '<span style="color:#16a34a">MIN</span>' : 
              (mvv == d.maxV ? '<span style="color:#d97706">MAX</span>' : ''));
+             
+    let cbt = (i == CELLS-1) ? cbTimes[15] : cbTimes[i];
+    let bledMh = ((cbt||0) * (37.0 / 3600.0)).toFixed(2) + ' mAh';
+    
     cellHtml += '<tr><td style="padding:2px 4px;border:1px solid #e0e3e8">C' + (i+1) + 
                 '</td><td style="padding:2px 4px;border:1px solid #e0e3e8">' + mvv + 
-                '</td><td style="padding:2px 4px;border:1px solid #e0e3e8">' + (cbTimes[i]||0) + 
+                '</td><td style="padding:2px 4px;border:1px solid #e0e3e8">' + (cbt||0) + 
+                '</td><td style="padding:2px 4px;border:1px solid #e0e3e8;color:#d97706">' + bledMh + 
                 '</td><td style="padding:2px 4px;border:1px solid #e0e3e8">' + st + '</td></tr>';
   }
   document.getElementById('kVCellData').innerHTML = cellHtml;
@@ -556,6 +607,25 @@ function updateUI(d){
   const sec = (d.manStat >> 4) & 0x03;
   document.getElementById('statSeal').innerHTML = (sec === 3 ? "SEALED" : (sec === 2 ? "UNSEALED" : "FULL ACCESS"));
   document.getElementById('statSeal').style.color = (sec === 3 ? "#16a34a" : "#dc2626");
+  
+  // Update Performance 
+  document.getElementById('perfI2C').textContent = (d.p_i2c||0).toFixed(1) + ' ms';
+  document.getElementById('perfEKF').textContent = (d.p_ekf||0).toFixed(1) + ' ms';
+  document.getElementById('perfWeb').textContent = (d.p_web||0).toFixed(1) + ' ms';
+  
+  const loadMs = (d.p_i2c||0) + (d.p_ekf||0) + (d.p_web||0);
+  const loadPct = (loadMs / 1000.0) * 100.0;
+  const idle = Math.max(0, 1000.0 - loadMs);
+  
+  const ll = document.getElementById('vTotalLoad');
+  ll.textContent = loadPct.toFixed(1) + "% (" + idle.toFixed(0) + "ms idle)";
+  ll.style.color = loadPct > 80 ? '#dc2626' : loadPct > 30 ? '#d97706' : '#16a34a';
+
+  if (!window.perfHist) window.perfHist = [];
+  const totalLoad = (d.p_i2c||0) + (d.p_ekf||0) + (d.p_web||0);
+  window.perfHist.push(totalLoad);
+  if(window.perfHist.length > 50) window.perfHist.shift();
+  drawChart('chartPerf', 'Combined Load (ms/s)', [{label:'Load', color:'#16a34a', data:window.perfHist}], 80);
   
   const pModes = ["ACTIVE", "SLEEP", "DEEP SLEEP", "SHUTDOWN"];
   let curMode = pModes[d.pwr] || "OFFLINE";
@@ -585,6 +655,8 @@ function updateUI(d){
   [{id:'tTs1',v:d.temp1},{id:'tTs2',v:d.temp2},{id:'tTs3',v:d.temp3},{id:'tChip',v:d.chipTemp}].forEach(t=>{const el=document.getElementById(t.id);el.textContent=t.v.toFixed(1)+'\u00B0C';el.style.color=tempColor(t.v);});
   const bc=document.getElementById('badgeChg');bc.textContent='CHG: '+(d.isCharging?'ON':'OFF');bc.className='badge '+(d.isCharging?'badge-green':'badge-red');
   const bd=document.getElementById('badgeDsg');bd.textContent='DSG: '+(d.isDischarging?'ON':'OFF');bd.className='badge '+(d.isDischarging?'badge-green':'badge-red');
+  const bddsg=document.getElementById('badgeDDSG');if(bddsg){bddsg.textContent='DDSG: '+(d.ddsg?'HIGH':'LOW');bddsg.className='badge '+(d.ddsg?'badge-green':'badge-red');bddsg.style='';}
+  const bdchg=document.getElementById('badgeDCHG');if(bdchg){bdchg.textContent='DCHG: '+(d.dchg?'HIGH':'LOW');bdchg.className='badge '+(d.dchg?'badge-green':'badge-red');bdchg.style='';}
   document.getElementById('fetChgToggle').className='toggle '+(d.isCharging?'on':'off');document.getElementById('fetChgBadge').textContent=d.isCharging?'ON':'OFF';document.getElementById('fetChgBadge').className='badge '+(d.isCharging?'badge-green':'badge-red');
   document.getElementById('fetDsgToggle').className='toggle '+(d.isDischarging?'on':'off');document.getElementById('fetDsgBadge').textContent=d.isDischarging?'ON':'OFF';document.getElementById('fetDsgBadge').className='badge '+(d.isDischarging?'badge-green':'badge-red');
   document.getElementById('fetWarn').style.display=(!d.isCharging&&!d.isDischarging)?'block':'none';
@@ -618,77 +690,89 @@ setInterval(()=>{fetchData();fetchLog();},1000);setInterval(drawCharts,1000);fet
 )rawliteral";
 
 // ==================== WEB HANDLERS ====================
-void handleRoot() { server.send_P(200, "text/html", INDEX_HTML); }
+void handleRoot() { 
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "-1");
+  server.send_P(200, "text/html", INDEX_HTML); 
+}
 
 void handleApiData()
 {
   float current_A = (float)bmsCurrent / 1000.0f;
   float parasitic_correction_mv = (fabsf(current_A) > 0.05f) ? (current_A * 2.43f * 1000.0f) : 0.0f;
   
-  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server.send(200, "application/json", "");
+  String json;
+  json.reserve(1024);
   
-  server.sendContent("{\"v\":[");
+  json += "{\"v\":[";
   for (int i = 0; i < 16; i++) { 
       float v = (i < TB_CONNECTED_CELLS) ? ((float)cellVoltages[i] - parasitic_correction_mv) : (float)cellVoltages[i];
-      server.sendContent(String(v, 0)); 
-      if (i < 15) server.sendContent(","); 
+      json += String(v, 0);
+      if (i < 15) json += ","; 
   }
-  server.sendContent("],\"vStack\":" + String(vStack));
-  server.sendContent(",\"vPack\":" + String(vPack));
-  server.sendContent(",\"current\":" + String(bmsCurrent));
-  server.sendContent(",\"charge\":" + String(software_charge_Ah * 1000.0f, 1));
-  server.sendContent(",\"chargeTime\":" + String(chargeTime));
-  server.sendContent(",\"chipTemp\":" + String(chipTemp, 1));
-  server.sendContent(",\"temp1\":" + String(temp1, 1));
-  server.sendContent(",\"temp2\":" + String(temp2, 1));
-  server.sendContent(",\"temp3\":" + String(temp3, 1));
-  server.sendContent(",\"isCharging\":" + String(isCharging ? 1 : 0));
-  server.sendContent(",\"isDischarging\":" + String(isDischarging ? 1 : 0));
-  server.sendContent(",\"fetEn\":" + String(fetEn ? 1 : 0));
-  server.sendContent(",\"ledState\":" + String(ledState ? 1 : 0));
-  server.sendContent(",\"prot_sc\":" + String(protStatus.bits.SC_DCHG ? 1 : 0));
-  server.sendContent(",\"prot_oc2\":" + String(protStatus.bits.OC2_DCHG ? 1 : 0));
-  server.sendContent(",\"prot_oc1\":" + String(protStatus.bits.OC1_DCHG ? 1 : 0));
-  server.sendContent(",\"prot_occ\":" + String(protStatus.bits.OC_CHG ? 1 : 0));
-  server.sendContent(",\"prot_ov\":" + String(protStatus.bits.CELL_OV ? 1 : 0));
-  server.sendContent(",\"prot_uv\":" + String(protStatus.bits.CELL_UV ? 1 : 0));
-  server.sendContent(",\"temp_otf\":" + String(tempStatus.bits.OVERTEMP_FET ? 1 : 0));
-  server.sendContent(",\"temp_oti\":" + String(tempStatus.bits.OVERTEMP_INTERNAL ? 1 : 0));
-  server.sendContent(",\"temp_otd\":" + String(tempStatus.bits.OVERTEMP_DCHG ? 1 : 0));
-  server.sendContent(",\"temp_otc\":" + String(tempStatus.bits.OVERTEMP_CHG ? 1 : 0));
-  server.sendContent(",\"temp_uti\":" + String(tempStatus.bits.UNDERTEMP_INTERNAL ? 1 : 0));
-  server.sendContent(",\"temp_utd\":" + String(tempStatus.bits.UNDERTEMP_DCHG ? 1 : 0));
-  server.sendContent(",\"temp_utc\":" + String(tempStatus.bits.UNDERTEMP_CHG ? 1 : 0));
+  json += "],\"vStack\":" + String(vStack);
+  json += ",\"vPack\":" + String(vPack);
+  json += ",\"current\":" + String(bmsCurrent);
+  json += ",\"charge\":" + String(software_charge_Ah * 1000.0f, 1);
+  json += ",\"chargeTime\":" + String(chargeTime);
+  json += ",\"chipTemp\":" + String(chipTemp, 1);
+  json += ",\"temp1\":" + String(temp1, 1);
+  json += ",\"temp2\":" + String(temp2, 1);
+  json += ",\"temp3\":" + String(temp3, 1);
+  json += ",\"isCharging\":" + String(isCharging ? 1 : 0);
+  json += ",\"isDischarging\":" + String(isDischarging ? 1 : 0);
+  json += ",\"fetEn\":" + String(fetEn ? 1 : 0);
+  json += ",\"ledState\":" + String(ledState ? 1 : 0);
+  json += ",\"prot_sc\":" + String(protStatus.bits.SC_DCHG ? 1 : 0);
+  json += ",\"prot_oc2\":" + String(protStatus.bits.OC2_DCHG ? 1 : 0);
+  json += ",\"prot_oc1\":" + String(protStatus.bits.OC1_DCHG ? 1 : 0);
+  json += ",\"prot_occ\":" + String(protStatus.bits.OC_CHG ? 1 : 0);
+  json += ",\"prot_ov\":" + String(protStatus.bits.CELL_OV ? 1 : 0);
+  json += ",\"prot_uv\":" + String(protStatus.bits.CELL_UV ? 1 : 0);
+  json += ",\"temp_otf\":" + String(tempStatus.bits.OVERTEMP_FET ? 1 : 0);
+  json += ",\"temp_oti\":" + String(tempStatus.bits.OVERTEMP_INTERNAL ? 1 : 0);
+  json += ",\"temp_otd\":" + String(tempStatus.bits.OVERTEMP_DCHG ? 1 : 0);
+  json += ",\"temp_otc\":" + String(tempStatus.bits.OVERTEMP_CHG ? 1 : 0);
+  json += ",\"temp_uti\":" + String(tempStatus.bits.UNDERTEMP_INTERNAL ? 1 : 0);
+  json += ",\"temp_utd\":" + String(tempStatus.bits.UNDERTEMP_DCHG ? 1 : 0);
+  json += ",\"temp_utc\":" + String(tempStatus.bits.UNDERTEMP_CHG ? 1 : 0);
   
   float cc_soc = 0.0f;
   if (initial_ekf_soc >= 0.0f) {
       cc_soc = constrain(initial_ekf_soc + (software_charge_Ah / 3.0f) * 100.0f, 0.0f, 100.0f);
   }
-  server.sendContent(",\"cc_soc\":" + String(cc_soc, 1));
-  server.sendContent(",\"soc_ekf\":" + String(soc_ekf, 1));
-  server.sendContent(",\"soc_uncertainty\":" + String(soc_uncertainty, 2));
-  server.sendContent(",\"vErr\":" + String(voltage_error_ekf, 1));
+  json += ",\"cc_soc\":" + String(cc_soc, 1);
+  json += ",\"soc_ekf\":" + String(soc_ekf, 1);
+  json += ",\"soc_uncertainty\":" + String(soc_uncertainty, 2);
+  json += ",\"vErr\":" + String(voltage_error_ekf, 1);
   
-  server.sendContent(",\"hwBalActive\":" + String(isHardwareBalancing ? 1 : 0));
-  server.sendContent(",\"autoBalActive\":" + String(useAutoBalancing ? 1 : 0));
-  server.sendContent(",\"bal\":" + String(balancingMask));
-  server.sendContent(",\"balTime\":" + String(totalBalancingTime));
-  server.sendContent(",\"cellDelta\":" + String(cellBalancingDelta));
-  server.sendContent(",\"minV\":" + String(minCellV));
-  server.sendContent(",\"maxV\":" + String(maxCellV));
-  server.sendContent(",\"cellBalTimes\":[");
+  json += ",\"hwBalActive\":" + String(isHardwareBalancing ? 1 : 0);
+  json += ",\"autoBalActive\":" + String(useAutoBalancing ? 1 : 0);
+  json += ",\"bal\":" + String(balancingMask);
+  json += ",\"balTime\":" + String(totalBalancingTime);
+  json += ",\"cellDelta\":" + String(cellBalancingDelta);
+  json += ",\"minV\":" + String(minCellV);
+  json += ",\"maxV\":" + String(maxCellV);
+  json += ",\"p_i2c\":" + String(perf_i2c_us / 1000.0f, 1);
+  json += ",\"p_ekf\":" + String(perf_ekf_us / 1000.0f, 1);
+  json += ",\"p_web\":" + String(perf_web_us / 1000.0f, 1);
+  json += ",\"cellBalTimes\":[";
   for (int i = 0; i < 16; i++) {
-    server.sendContent(String(cellBalancingTimes[i]));
-    if (i < 15) server.sendContent(",");
+    json += String(cellBalancingTimes[i]);
+    if (i < 15) json += ",";
   }
-  server.sendContent("]");
-  server.sendContent(",\"manStat\":" + String(manufStatus));
-  server.sendContent(",\"pwr\":" + String(powerMode));
-  server.sendContent(",\"txCount\":" + String(txCount));
-  server.sendContent(",\"pendingPwr\":" + String(pendingPwrMode));
-  server.sendContent("}");
-  server.sendContent(""); // Final empty chunk
+  json += "]";
+  json += ",\"manStat\":" + String(manufStatus);
+  json += ",\"pwr\":" + String(powerMode);
+  json += ",\"txCount\":" + String(txCount);
+  json += ",\"pendingPwr\":" + String(pendingPwrMode);
+  json += ",\"ddsg\":" + String((lastFetStat & 0x20) ? 1 : 0);
+  json += ",\"dchg\":" + String((lastFetStat & 0x10) ? 1 : 0);
+  json += ",\"balMaster\":" + (balancingEnabled ? String("true") : String("false"));
+  json += "}";
+  
+  server.send(200, "application/json", json);
 }
 
 void handleApiLog()
@@ -722,6 +806,7 @@ void handleApiCmd()
     digitalWrite(TB_PIN_CFETOFF, LOW); // Pin LOW allows ON
     bms.CommandOnlysubCommand(0x0096);  // Subcmd 0x0096 turns All Fets ON
     delay(50);
+    Serial.printf("[FET] After CHG ON: CFETOFF_pin=%d DFETOFF_pin=%d\n", digitalRead(TB_PIN_CFETOFF), digitalRead(TB_PIN_DFETOFF));
   }
   else if (action == "chgOff") {
     Serial.println("=== CHG OFF (Hybrid) ===");
@@ -730,6 +815,7 @@ void handleApiCmd()
     digitalWrite(TB_PIN_CFETOFF, HIGH); // Pin HIGH forces OFF
     bms.CommandOnlysubCommand(0x0094);   // Subcmd 0x0094 turns CHG OFF
     delay(50);
+    Serial.printf("[FET] After CHG OFF: CFETOFF_pin=%d DFETOFF_pin=%d\n", digitalRead(TB_PIN_CFETOFF), digitalRead(TB_PIN_DFETOFF));
   }
   else if (action == "dsgOn") {
     Serial.println("=== DSG ON (Hybrid) ===");
@@ -738,6 +824,7 @@ void handleApiCmd()
     digitalWrite(TB_PIN_DFETOFF, LOW); // Pin LOW allows ON
     bms.CommandOnlysubCommand(0x0096);  // Subcmd 0x0096 turns All Fets ON
     delay(50);
+    Serial.printf("[FET] After DSG ON: CFETOFF_pin=%d DFETOFF_pin=%d\n", digitalRead(TB_PIN_CFETOFF), digitalRead(TB_PIN_DFETOFF));
   }
   else if (action == "dsgOff") {
     Serial.println("=== DSG OFF (Hybrid) ===");
@@ -746,17 +833,30 @@ void handleApiCmd()
     digitalWrite(TB_PIN_DFETOFF, HIGH); // Pin HIGH forces OFF
     bms.CommandOnlysubCommand(0x0093);   // Subcmd 0x0093 turns DSG OFF
     delay(50);
+    Serial.printf("[FET] After DSG OFF: CFETOFF_pin=%d DFETOFF_pin=%d\n", digitalRead(TB_PIN_CFETOFF), digitalRead(TB_PIN_DFETOFF));
   }
   else if (action == "resetCharge"){ bms.ResetAccumulatedCharge(); addLog(0x3E, 0x0082, true, true); }
   else if (action == "toggleBal") {
       useAutoBalancing = !useAutoBalancing;
       Serial.printf("=== SWAPPING TO %s BALANCING MODE ===\n", useAutoBalancing ? "AUTONOMOUS" : "HOST");
-      bms.CommandOnlysubCommand(0x0090); // ENTER CONFIG UPDATE
-      delay(50);
-      bms.writeByteToMemory(0x9335, useAutoBalancing ? 0x07 : 0x00);
-      delay(20);
-      bms.CommandOnlysubCommand(0x0092); // EXIT CONFIG UPDATE
-      delay(50);
+      // writeByteToMemory internally handles ENTER/EXIT config update
+      bms.writeByteToMemory(0x9335, (balancingEnabled && useAutoBalancing) ? 0x07 : 0x00);
+      delay(250); // TRM requires up to 250ms after exiting Config Update before BQ76952 accepts commands
+      if (!useAutoBalancing || !balancingEnabled) {
+          hostRequestedMask = 0;
+          bms.setBalancingMask(0);
+      }
+  }
+  else if (action == "toggleBalMaster") {
+      balancingEnabled = !balancingEnabled;
+      Serial.printf("=== BALANCING MASTER %s ===\n", balancingEnabled ? "ENABLED" : "DISABLED");
+      // writeByteToMemory internally handles ENTER/EXIT config update
+      bms.writeByteToMemory(0x9335, (balancingEnabled && useAutoBalancing) ? 0x07 : 0x00);
+      delay(250); // TRM requires up to 250ms after exiting Config Update before BQ76952 accepts commands
+      if (!balancingEnabled) {
+          hostRequestedMask = 0;
+          bms.setBalancingMask(0);
+      }
   }
   else if (action == "reset")      { bms.reset();           addLog(0x3E, 0x0012, true, true); }
   else if (action == "pwrSleep")   {
@@ -1009,6 +1109,11 @@ void setup()
   pinMode(TB_PIN_CFETOFF, OUTPUT);
   pinMode(TB_PIN_DFETOFF, OUTPUT);
   
+  // DDSG/DCHG state is now read from FET_Status register (0x7F) bits 5,4
+  // No GPIO needed — the BQ76952 reports its own gate driver state over I2C
+  Serial.printf("[TB-Dash] FET Control: CFETOFF=GPIO%d, DFETOFF=GPIO%d\n", TB_PIN_CFETOFF, TB_PIN_DFETOFF);
+  Serial.println("[TB-Dash] DDSG/DCHG status: Reading from FET_Status register (0x7F)");
+  
   // Hardware Logic: HIGH = OFF, LOW = ON (Force OFF by default)
   digitalWrite(TB_PIN_CFETOFF, HIGH); 
   digitalWrite(TB_PIN_DFETOFF, HIGH);
@@ -1028,17 +1133,29 @@ void setup()
 // ==================== LOOP ====================
 void loop()
 {
+  uint32_t t0 = micros();
   server.handleClient();
+  uint32_t dt = micros() - t0;
+  if (dt > web_peak_us) web_peak_us = dt;
+
   if (millis() - lastRead >= READ_INTERVAL_MS)
   {
     lastRead = millis();
+    t0 = micros();
     readBMSData();
+    perf_i2c_us = micros() - t0;
   }
   if (millis() - lastEKFUpdate >= EKF_UPDATE_INTERVAL)
   {
     lastEKFUpdate = millis();
+    t0 = micros();
     updateEKF();
     hostBalancingLoop(); // Engage explicitly if Auto is manually toggled out
+    perf_ekf_us = micros() - t0;
+    
+    // Lock in the peak web-API execution time over the last second for stable UI monitoring
+    perf_web_us = web_peak_us;
+    web_peak_us = 0;
   }
   delay(2);
 }
