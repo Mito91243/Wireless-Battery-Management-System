@@ -1,7 +1,11 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
+import { useAuth } from "../context/AuthContext";
 
 export default function SignUpComponent() {
+  const { register } = useAuth();
+  const navigate = useNavigate();
+
   const [formData, setFormData] = useState({
     firstName: "",
     lastName: "",
@@ -61,11 +65,24 @@ export default function SignUpComponent() {
     return Object.keys(newErrors).length === 0;
   };
 
-  const handleSubmit = () => {
+  const [isLoading, setIsLoading] = useState(false);
+
+  const handleSubmit = async () => {
     if (validateForm()) {
-      console.log("Form submitted:", formData);
-      // Handle successful form submission here
-      alert("Account created successfully!");
+      setIsLoading(true);
+      try {
+        await register(
+          formData.firstName,
+          formData.lastName,
+          formData.email,
+          formData.password
+        );
+        navigate("/dashboard");
+      } catch (error) {
+        setErrors({ general: error.message || "Registration failed" });
+      } finally {
+        setIsLoading(false);
+      }
     }
   };
 
@@ -113,6 +130,11 @@ export default function SignUpComponent() {
           </div>
 
           <div className="space-y-4">
+            {errors.general && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-md">
+                <p className="text-sm text-red-600">{errors.general}</p>
+              </div>
+            )}
             {/* Name Fields */}
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <div>
@@ -240,9 +262,14 @@ export default function SignUpComponent() {
             <button
               type="button"
               onClick={handleSubmit}
-              className="w-full flex justify-center py-3 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-slate-800 hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-slate-500 transition duration-200"
+              disabled={isLoading}
+              className={`w-full flex justify-center py-3 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white transition duration-200 ${
+                isLoading
+                  ? "bg-slate-400 cursor-not-allowed"
+                  : "bg-slate-800 hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-slate-500"
+              }`}
             >
-              Create account
+              {isLoading ? "Creating account..." : "Create account"}
             </button>
           </div>
 

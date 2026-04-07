@@ -1,7 +1,12 @@
-# schemas.py (optional but recommended for Pydantic models)
 from pydantic import BaseModel, EmailStr
 from datetime import datetime
 from typing import Optional
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
 
 class UserCreate(BaseModel):
     first_name: str
@@ -9,24 +14,35 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str
 
+
 class UserResponse(BaseModel):
     id: int
     first_name: str
     last_name: str
     email: str
-    
+
     class Config:
         from_attributes = True
 
+
 class PackCreate(BaseModel):
     name: str
+    pack_identifier: str
+    series_count: int = 13
+    parallel_count: int = 4
+
 
 class PackResponse(BaseModel):
     id: int
     name: str
-    
+    pack_identifier: str
+    series_count: int
+    parallel_count: int
+    user_id: int
+
     class Config:
         from_attributes = True
+
 
 class ReadingCreate(BaseModel):
     pack_id: int
@@ -40,6 +56,7 @@ class ReadingCreate(BaseModel):
     ekf_soc: float
     power: Optional[float] = None
     charging_discharging: Optional[bool] = None
+
 
 class BatteryReadingCreate(BaseModel):
     battery_position: int

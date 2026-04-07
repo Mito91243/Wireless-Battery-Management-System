@@ -1,9 +1,17 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
+import { useAuth } from "../context/AuthContext";
 
 export default function Header() {
+  const { isAuthenticated, logout } = useAuth();
+  const navigate = useNavigate();
   let [isPressed, setisPressed] = useState(false);
   let [close, setisClosed] = useState(false);
+
+  const handleLogout = () => {
+    logout();
+    navigate("/");
+  };
 
   return (
     <>
@@ -285,18 +293,37 @@ export default function Header() {
             </a>
           </div>
           <div className="hidden lg:flex lg:flex-1 lg:justify-end">
-            <Link
-              to="signup"
-              className="text-sm font-semibold leading-6 text-gray-900 mr-12 hover:text-green-400"
-            >
-              Sign up <span aria-hidden="true"></span>
-            </Link>
-            <Link
-              to="/login"
-              className="text-sm font-semibold leading-6 text-gray-900 hover:text-green-400"
-            >
-              Log in <span aria-hidden="true"></span>
-            </Link>
+            {isAuthenticated ? (
+              <>
+                <Link
+                  to="/dashboard"
+                  className="text-sm font-semibold leading-6 text-gray-900 mr-12 hover:text-green-400"
+                >
+                  Dashboard
+                </Link>
+                <button
+                  onClick={handleLogout}
+                  className="text-sm font-semibold leading-6 text-gray-900 hover:text-red-500"
+                >
+                  Log out
+                </button>
+              </>
+            ) : (
+              <>
+                <Link
+                  to="/signup"
+                  className="text-sm font-semibold leading-6 text-gray-900 mr-12 hover:text-green-400"
+                >
+                  Sign up
+                </Link>
+                <Link
+                  to="/login"
+                  className="text-sm font-semibold leading-6 text-gray-900 hover:text-green-400"
+                >
+                  Log in
+                </Link>
+              </>
+            )}
           </div>
         </nav>
         {close ? (

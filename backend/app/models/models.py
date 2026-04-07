@@ -1,7 +1,7 @@
 # models.py
 from sqlalchemy import Boolean, Column, Integer, String, Float, DateTime, ForeignKey, Index
 from sqlalchemy.orm import relationship
-from database import Base
+from app.models.database import Base
 from datetime import datetime
 
 class User(Base):
@@ -13,11 +13,25 @@ class User(Base):
     email = Column(String(255), unique=True, nullable=False, index=True)
     password = Column(String(255), nullable=False)
 
+    packs = relationship("Pack", back_populates="owner", cascade="all, delete-orphan")
+
+
 class Pack(Base):
     __tablename__ = "packs"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    name = Column(String(255), unique=True, nullable=False, index=True)
+    name = Column(String(255), nullable=False, index=True)
+    pack_identifier = Column(String(50), unique=True, nullable=False, index=True)
+    series_count = Column(Integer, nullable=False, default=13)
+    parallel_count = Column(Integer, nullable=False, default=4)
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    owner = relationship("User", back_populates="packs")
     
     # Relationships - One Pack has many Readings and BatteryReadings
     readings = relationship(

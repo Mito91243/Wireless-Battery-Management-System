@@ -1,6 +1,6 @@
 # init_db.py
-from database import engine, Base
-import models
+from app.models.database import engine, Base
+from app.models import models
 
 def init_database():
     """Initialize database tables - run this once"""

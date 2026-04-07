@@ -1,0 +1,63 @@
+import { createContext, useContext, useState, useEffect } from "react";
+import { apiFetch } from "../lib/api";
+
+const AuthContext = createContext(null);
+
+export function AuthProvider({ children }) {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const token = localStorage.getItem("wbms_token");
+    if (!token) {
+      setLoading(false);
+      return;
+    }
+    apiFetch("/v1/auth/me")
+      .then((data) => setUser(data))
+      .catch(() => {
+        localStorage.removeItem("wbms_token");
+      })
+      .finally(() => setLoading(false));
+  }, []);
+
+  async function login(email, password) {
+    const body = new URLSearchParams({ username: email, password });
+    const data = await apiFetch("/v1/auth/login", { method: "POST", body });
+    localStorage.setItem("wbms_token", data.access_token);
+    const me = await apiFetch("/v1/auth/me");
+    setUser(me);
+  }
+
+  async function register(firstName, lastName, email, password) {
+    await apiFetch("/v1/auth/register", {
+      method: "POST",
+      body: JSON.stringify({
+        first_name: firstName,
+        last_name: lastName,
+        email,
+        password,
+      }),
+    });
+    await login(email, password);
+  }
+
+  function logout() {
+    localStorage.removeItem("wbms_token");
+    setUser(null);
+  }
+
+  return (
+    <AuthContext.Provider
+      value={{ user, loading, isAuthenticated: !!user, login, register, logout }}
+    >
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth() {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error("useAuth must be used within AuthProvider");
+  return ctx;
+}

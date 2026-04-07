@@ -1,6 +1,11 @@
 import { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+
 export default function SignInComponent() {
+  const { login } = useAuth();
+  const navigate = useNavigate();
+
   const [formData, setFormData] = useState({
     email: '',
     password: ''
@@ -47,12 +52,10 @@ export default function SignInComponent() {
     if (validateForm()) {
       setIsLoading(true);
       try {
-        console.log('Sign in attempted:', { ...formData, rememberMe });
-        // Simulate API call
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        alert('Sign in successful!');
+        await login(formData.email, formData.password);
+        navigate('/dashboard');
       } catch (error) {
-        console.error('Sign in failed:', error);
+        setErrors({ general: error.message || 'Invalid email or password' });
       } finally {
         setIsLoading(false);
       }
@@ -98,6 +101,11 @@ export default function SignInComponent() {
           </div>
 
           <div className="space-y-4">
+            {errors.general && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-md">
+                <p className="text-sm text-red-600">{errors.general}</p>
+              </div>
+            )}
             {/* Email */}
             <div>
               <label htmlFor="email" className="block text-sm font-medium text-gray-700 mb-1">

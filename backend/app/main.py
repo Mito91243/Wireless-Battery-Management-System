@@ -1,18 +1,48 @@
-from typing import List, Optional
-import datetime
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
-from datetime import datetime 
-from fastapi.middleware.cors import CORSMiddleware
-import random
+from typing import List
+from datetime import datetime
 
-app = FastAPI(title="ESP32 Data Backend", version="1.0.0")
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from app.models.database import engine, Base
+from app.routes.auth import router as auth_router
+from app.routes.packs import router as packs_router
+
+# Import models so Base knows about them
+from app.models import models  # noqa: F401
+
+app = FastAPI(title="WBMS Backend", version="1.0.0")
+
+
+@app.on_event("startup")
+def on_startup():
+    try:
+        Base.metadata.create_all(bind=engine)
+    except Exception as e:
+        print(f"Warning: Could not create tables on startup: {e}")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include routers
+app.include_router(auth_router)
+app.include_router(packs_router)
+
+
+# --- Legacy / utility endpoints ---
 
 class ESP32Data(BaseModel):
     senderIndex: int
     sensorValue: float
     buttonState: bool
     message: str
+
 
 class SensorReading(BaseModel):
     senderIndex: int
@@ -21,21 +51,14 @@ class SensorReading(BaseModel):
     message: str
     timestamp: str
 
+
 sensor_readings: List[SensorReading] = []
-
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 @app.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "WBMS API"}
+
 
 @app.post("/v1/sensor-data")
 async def receive_sensor_data(data: ESP32Data):
@@ -45,7 +68,7 @@ async def receive_sensor_data(data: ESP32Data):
             sensorValue=data.sensorValue,
             buttonState=data.buttonState,
             message=data.message,
-            timestamp=datetime.now().replace(microsecond=0).isoformat()
+            timestamp=datetime.now().replace(microsecond=0).isoformat(),
         )
         sensor_readings.append(new_reading)
 
@@ -56,62 +79,10 @@ async def receive_sensor_data(data: ESP32Data):
             "status": "success",
             "message": "Data received successfully",
             "received_at": new_reading.timestamp,
-            "Data Recieved": {
-                "Sender Index":data.senderIndex,
-                "Sensor Value":data.sensorValue,
-                "Button State":data.buttonState,
-                "Message": data.message
-            }
-
         }
-
     except Exception as e:
         print(f"Error processing data: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/v1/pack-data/latest")
-async def get_latest_data():
-    battery_packs = []
-
-    for name, pack_id, base_status in [
-        ("Pack Alpha", "BP001", "safe"),
-        ("Pack Beta", "BP002", "caution"),
-    ]:
-        soc = random.randint(50, 100)          # State of charge (50–100%)
-        soh = random.randint(90, 100)          # State of health (90–100%)
-        voltage = round(random.uniform(45.0, 54.0), 2)  # Volts
-        current = round(random.uniform(5.0, 15.0), 2)   # Amps
-        temp = round(random.uniform(25.0, 40.0), 2)     # Celsius
-
-        # 13S4P = 52 cells
-        cells = []
-        for i in range(52):
-            cell_voltage = round(random.uniform(3.2, 4.2), 2)
-            cell_status = "caution" if cell_voltage < 3.3 or cell_voltage > 4.1 else "safe"
-            cells.append({"value": f"{cell_voltage:.2f}", "status": cell_status})
-
-        battery_packs.append({
-            "name": name,
-            "id": pack_id,
-            "status": base_status if random.random() > 0.2 else "caution",  # sometimes flip
-            "soc": soc,
-            "soh": soh,
-            "voltage": str(voltage),
-            "current": str(current),
-            "temp": str(temp),
-            "config": "13S4P (52 cells)",
-            "series": "13",
-            "parallel": "4",
-            "cells": cells
-        })
-
-    return {
-        "status": "success",
-        "timestamp": datetime.now().replace(microsecond=0).isoformat(),
-        "packs": battery_packs
-    }
-
-
 
 
 @app.get("/health")
@@ -119,5 +90,5 @@ async def health_check():
     return {
         "status": "Healthy",
         "total_readings": len(sensor_readings),
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
     }

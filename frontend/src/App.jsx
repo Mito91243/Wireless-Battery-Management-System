@@ -7,7 +7,8 @@ import SignInComponent from "./pages/Login";
 import AboutPage from "./pages/About";
 import FeaturesPage from "./pages/Features";
 import HomePage from "./pages/Home";
-import { useLocation } from 'react-router-dom';
+import ProtectedRoute from "./components/ProtectedRoute";
+import { useLocation } from "react-router-dom";
 
 function App() {
   const location = useLocation();
@@ -17,13 +18,15 @@ function App() {
     <>
       {!isDashboard && <Header />}
       <Routes>
-        <Route path="/dashboard" element={<Dashboard />}></Route>
-        <Route path="/signup" element={<SignUpComponent />}></Route>
-        <Route path="/login" element={<SignInComponent />}></Route>
-        <Route path="/about" element={<AboutPage />}></Route>
-        <Route path="/features" element={<FeaturesPage />}></Route>
-        <Route path="/" element={<HomePage />}></Route>
-        <Route path="*" element={<FeaturesPage />}></Route>
+        <Route element={<ProtectedRoute />}>
+          <Route path="/dashboard" element={<Dashboard />} />
+        </Route>
+        <Route path="/signup" element={<SignUpComponent />} />
+        <Route path="/login" element={<SignInComponent />} />
+        <Route path="/about" element={<AboutPage />} />
+        <Route path="/features" element={<FeaturesPage />} />
+        <Route path="/" element={<HomePage />} />
+        <Route path="*" element={<FeaturesPage />} />
       </Routes>
     </>
   );

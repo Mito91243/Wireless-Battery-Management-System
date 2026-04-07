@@ -1,6 +1,9 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { Battery, Zap, AlertTriangle, Thermometer, Activity, History, Clock, TrendingUp, AlertCircle, ExternalLink, Wifi, Home, BarChart3, RefreshCw } from 'lucide-react';
+import { Battery, Zap, AlertTriangle, Thermometer, Activity, History, Clock, TrendingUp, AlertCircle, ExternalLink, Wifi, Home, BarChart3, RefreshCw, Plus, X, Trash2, LogOut } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, ResponsiveContainer, Legend, Tooltip, CartesianGrid } from 'recharts';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import { apiFetch } from '../lib/api';
 
 // Custom Tabs Component
 const TabsContext = React.createContext();
@@ -42,14 +45,14 @@ const TabsContent = ({ value, children, className }) => {
 // Utility Components
 const StatusBadge = ({ status }) => {
   const styles = {
-    safe: 'bg-green-100 text-green-700 border-green-200',
-    caution: 'bg-yellow-100 text-yellow-700 border-yellow-200',
-    alert: 'bg-red-100 text-red-700 border-red-200',
-    default: 'bg-gray-100 text-gray-700 border-gray-200'
+    safe: 'bg-emerald-50 text-emerald-600 border-emerald-200',
+    caution: 'bg-amber-50 text-amber-600 border-amber-200',
+    alert: 'bg-rose-50 text-rose-600 border-rose-200',
+    default: 'bg-gray-50 text-gray-600 border-gray-200'
   };
 
   return (
-    <span className={`px-2 py-1 rounded-full text-xs font-medium border ${styles[status] || styles.default}`}>
+    <span className={`px-2.5 py-1 rounded-md text-xs font-semibold border ${styles[status] || styles.default}`}>
       {status.charAt(0).toUpperCase() + status.slice(1)}
     </span>
   );
@@ -69,48 +72,55 @@ const ErrorMessage = ({ message }) => (
 );
 
 // Battery Grid Component
-const BatteryGrid = ({ cells }) => {
+const BatteryGrid = ({ cells, config, series, parallel }) => {
+  const s = parseInt(series) || 13;
+  const p = parseInt(parallel) || 4;
+
   const cellStats = useMemo(() => ({
     safe: cells.filter(c => c.status === 'safe').length,
     caution: cells.filter(c => c.status === 'caution').length,
     alert: cells.filter(c => c.status === 'alert').length
   }), [cells]);
 
-  const getCellColor = (status) => {
+  const getCellBg = (status) => {
     switch(status) {
-      case 'safe': return 'from-emerald-400 to-emerald-500 hover:from-emerald-500 hover:to-emerald-600';
-      case 'caution': return 'from-amber-400 to-amber-500 hover:from-amber-500 hover:to-amber-600';
-      case 'alert': return 'from-red-400 to-red-500 hover:from-red-500 hover:to-red-600';
-      default: return 'from-gray-400 to-gray-500';
+      case 'safe': return 'bg-slate-100 text-slate-700 border-slate-200';
+      case 'caution': return 'bg-amber-50 text-amber-700 border-amber-300';
+      case 'alert': return 'bg-rose-50 text-rose-700 border-rose-300';
+      default: return 'bg-gray-100 text-gray-500 border-gray-200';
     }
   };
 
+  const getLegendDot = (status) => ({
+    safe: 'bg-slate-400',
+    caution: 'bg-amber-400',
+    alert: 'bg-rose-400',
+  }[status] || 'bg-gray-300');
+
   return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between text-xs text-gray-600">
-        <span>Battery Configuration: 13S4P (52 cells)</span>
-        <span>13 series × 4 parallel</span>
+    <div className="space-y-3">
+      <div className="flex items-center justify-between text-xs text-gray-400 font-medium">
+        <span>{config || `${s}S${p}P (${cells.length} cells)`}</span>
+        <span>{s}S x {p}P</span>
       </div>
-      <div className="grid gap-2" style={{gridTemplateColumns: 'repeat(13, minmax(0, 1fr))'}}>
+      <div className="grid gap-1" style={{gridTemplateColumns: `repeat(${s}, minmax(0, 1fr))`}}>
         {cells.map((cell, index) => (
           <div
             key={index}
-            className={`w-7 h-10 rounded-lg flex items-center justify-center transition-all duration-300 hover:scale-105 cursor-pointer shadow-sm hover:shadow-md bg-gradient-to-b ${getCellColor(cell.status)}`}
-            title={`Cell ${index + 1}: ${cell.value}V - Status: ${cell.status}`}
+            className={`h-8 rounded border flex items-center justify-center transition-colors cursor-default ${getCellBg(cell.status)}`}
+            title={`Cell ${index + 1}: ${cell.value}V`}
           >
-            <span className="text-xs font-bold text-white leading-none">
+            <span className="text-[10px] font-mono font-semibold leading-none">
               {cell.value}
             </span>
           </div>
         ))}
       </div>
-      <div className="flex items-center gap-6 text-xs">
+      <div className="flex items-center gap-4 text-xs text-gray-500">
         {Object.entries(cellStats).map(([status, count]) => (
-          <div key={status} className="flex items-center gap-2">
-            <div className={`w-3 h-3 rounded border bg-gradient-to-b ${getCellColor(status)}`}></div>
-            <span className="text-gray-600 font-medium">
-              {status.charAt(0).toUpperCase() + status.slice(1)} ({count})
-            </span>
+          <div key={status} className="flex items-center gap-1.5">
+            <div className={`w-2 h-2 rounded-full ${getLegendDot(status)}`}></div>
+            <span>{status.charAt(0).toUpperCase() + status.slice(1)} ({count})</span>
           </div>
         ))}
       </div>
@@ -175,8 +185,121 @@ const TrendChart = React.memo(({ data, title, subtitle, dataKeys }) => (
   </div>
 ));
 
+// Add Pack Modal Component
+const AddPackModal = ({ isOpen, onClose, onPackCreated }) => {
+  const [form, setForm] = useState({ name: '', pack_identifier: '', series_count: 13, parallel_count: 4 });
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+
+  if (!isOpen) return null;
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!form.name.trim() || !form.pack_identifier.trim()) {
+      setError('Pack name and identifier are required');
+      return;
+    }
+    setSubmitting(true);
+    setError('');
+    try {
+      await apiFetch('/v1/packs', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: form.name,
+          pack_identifier: form.pack_identifier,
+          series_count: parseInt(form.series_count) || 13,
+          parallel_count: parseInt(form.parallel_count) || 4,
+        }),
+      });
+      setForm({ name: '', pack_identifier: '', series_count: 13, parallel_count: 4 });
+      onPackCreated();
+      onClose();
+    } catch (err) {
+      setError(err.message || 'Failed to create pack');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-md">
+        <div className="flex items-center justify-between p-6 border-b border-gray-200">
+          <h2 className="text-xl font-bold text-gray-900">Add Battery Pack</h2>
+          <button onClick={onClose} className="p-1 hover:bg-gray-100 rounded-lg">
+            <X className="h-5 w-5 text-gray-500" />
+          </button>
+        </div>
+        <form onSubmit={handleSubmit} className="p-6 space-y-4">
+          {error && (
+            <div className="p-3 bg-red-50 border border-red-200 rounded-md text-sm text-red-600">{error}</div>
+          )}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Pack Name</label>
+            <input
+              type="text"
+              value={form.name}
+              onChange={(e) => setForm(f => ({ ...f, name: e.target.value }))}
+              placeholder="e.g. Pack Alpha"
+              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Pack ID (Hardware Identifier)</label>
+            <input
+              type="text"
+              value={form.pack_identifier}
+              onChange={(e) => setForm(f => ({ ...f, pack_identifier: e.target.value }))}
+              placeholder="e.g. BP001 or sender index"
+              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            <p className="mt-1 text-xs text-gray-500">This should match the hardware sender ID of your battery pack</p>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Series Count</label>
+              <input
+                type="number"
+                min="1"
+                value={form.series_count}
+                onChange={(e) => setForm(f => ({ ...f, series_count: e.target.value }))}
+                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Parallel Count</label>
+              <input
+                type="number"
+                min="1"
+                value={form.parallel_count}
+                onChange={(e) => setForm(f => ({ ...f, parallel_count: e.target.value }))}
+                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+          </div>
+          <div className="p-3 bg-gray-50 rounded-lg text-sm text-gray-600">
+            Configuration: <span className="font-semibold">{form.series_count}S{form.parallel_count}P</span> ({(parseInt(form.series_count) || 0) * (parseInt(form.parallel_count) || 0)} cells)
+          </div>
+          <button
+            type="submit"
+            disabled={submitting}
+            className={`w-full py-3 px-4 rounded-md text-sm font-medium text-white transition ${
+              submitting ? 'bg-blue-300 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'
+            }`}
+          >
+            {submitting ? 'Creating...' : 'Add Pack'}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+};
+
 // Main Dashboard Component
 const Dashboard = () => {
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+
   const [currentTime, setCurrentTime] = useState(new Date());
   const [isConnected, setIsConnected] = useState(true);
   const [batteryPacks, setBatteryPacks] = useState([]);
@@ -184,42 +307,73 @@ const Dashboard = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [refreshKey, setRefreshKey] = useState(0);
-  
+  const [showAddPack, setShowAddPack] = useState(false);
+  const [deletingPackId, setDeletingPackId] = useState(null);
+  const [userPacks, setUserPacks] = useState([]);
+
   // Add this ref to track last update time
   const lastUpdateTime = useRef(null);
+
+  const handleLogout = () => {
+    logout();
+    navigate('/');
+  };
+
+  // Fetch user's registered packs
+  const fetchUserPacks = useCallback(async () => {
+    try {
+      const data = await apiFetch('/v1/packs');
+      setUserPacks(data);
+    } catch (err) {
+      if (err.status === 401) {
+        logout();
+        navigate('/login');
+      }
+    }
+  }, [logout, navigate]);
+
+  // Delete a pack
+  const handleDeletePack = async (packId) => {
+    if (!confirm('Are you sure you want to remove this battery pack?')) return;
+    setDeletingPackId(packId);
+    try {
+      await apiFetch(`/v1/packs/${packId}`, { method: 'DELETE' });
+      fetchUserPacks();
+      setRefreshKey(k => k + 1);
+    } catch (err) {
+      console.error('Failed to delete pack:', err);
+    } finally {
+      setDeletingPackId(null);
+    }
+  };
 
   // Fetch battery data
   const fetchBatteryData = useCallback(async () => {
     try {
       setError(null);
-      const response = await fetch("http://127.0.0.1:8000/v1/pack-data/latest");
-      
-      if (!response.ok) {
-        throw new Error(`Failed to fetch: ${response.status}`);
-      }
-      
-      const data = await response.json();
+      const data = await apiFetch('/v1/packs/data/latest');
+
       setBatteryPacks(data.packs || []);
       setIsConnected(true);
-      
+
       // Update historical data with new data point
       const now = new Date();
-      const timestamp = now.toLocaleTimeString('en-US', { 
-        hour: '2-digit', 
+      const timestamp = now.toLocaleTimeString('en-US', {
+        hour: '2-digit',
         minute: '2-digit',
         second: '2-digit',
-        hour12: true 
+        hour12: true
       });
 
       if (data.packs && data.packs.length > 0) {
         // Only update if at least 1 second has passed
         if (!lastUpdateTime.current || now.getTime() - lastUpdateTime.current >= 1000) {
           lastUpdateTime.current = now.getTime();
-          
+
           const avgVoltage = data.packs.reduce((sum, p) => sum + parseFloat(p.voltage), 0) / data.packs.length;
           const avgCurrent = data.packs.reduce((sum, p) => sum + parseFloat(p.current), 0) / data.packs.length;
           const avgTemp = data.packs.reduce((sum, p) => sum + parseFloat(p.temp), 0) / data.packs.length;
-          
+
           const newDataPoint = {
             time: timestamp,
             voltage: Number(avgVoltage.toFixed(1)),
@@ -227,7 +381,7 @@ const Dashboard = () => {
             temperature: Number(avgTemp.toFixed(1)),
             power: Number((avgVoltage * avgCurrent).toFixed(1))
           };
-          
+
           setHistoricalData(prev => {
             const newData = [...prev, newDataPoint];
             // Keep only last 50 data points for better visibility
@@ -235,21 +389,31 @@ const Dashboard = () => {
           });
         }
       }
-      
+
       setLoading(false);
-    } catch (error) {
-      console.error("Error fetching battery data:", error);
-      setError(error.message);
+    } catch (err) {
+      if (err.status === 401) {
+        logout();
+        navigate('/login');
+        return;
+      }
+      console.error("Error fetching battery data:", err);
+      setError(err.message);
       setIsConnected(false);
       setLoading(false);
     }
-  }, []);
+  }, [logout, navigate]);
 
   // Update current time
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
     return () => clearInterval(timer);
   }, []);
+
+  // Fetch user packs on mount
+  useEffect(() => {
+    fetchUserPacks();
+  }, [fetchUserPacks, refreshKey]);
 
   // Fetch data on mount and set up polling
   useEffect(() => {
@@ -309,85 +473,74 @@ const Dashboard = () => {
 
   // Battery Pack Card Component
   const BatteryPackCard = ({ pack }) => {
-    const getStatusGradient = (status) => ({
-      safe: 'from-green-50 to-green-25 border-green-200',
-      caution: 'from-yellow-50 to-yellow-25 border-yellow-200',
-      alert: 'from-red-50 to-red-25 border-red-200'
-    }[status] || 'from-gray-50 to-white border-gray-200');
+    const accentColor = {
+      safe: 'bg-emerald-500',
+      caution: 'bg-amber-500',
+      alert: 'bg-rose-500'
+    }[pack.status] || 'bg-gray-400';
 
-    const getStatusBarColor = (status) => ({
-      safe: 'bg-gradient-to-r from-green-500 to-green-400',
-      caution: 'bg-gradient-to-r from-yellow-500 to-yellow-400',
-      alert: 'bg-gradient-to-r from-red-500 to-red-400'
-    }[status] || 'bg-gray-400');
+    const socColor = pack.soc > 50 ? 'bg-slate-700' : pack.soc > 20 ? 'bg-amber-500' : 'bg-rose-500';
+    const sohColor = pack.soh > 80 ? 'bg-slate-700' : pack.soh > 60 ? 'bg-amber-500' : 'bg-rose-500';
 
     return (
-      <div className={`rounded-lg p-6 shadow-sm border-2 bg-gradient-to-br ${getStatusGradient(pack.status)} hover:shadow-md transition-all duration-300 hover:scale-[1.01] relative overflow-hidden`}>
-        <div className={`absolute top-0 left-0 right-0 h-1 ${getStatusBarColor(pack.status)}`} />
-        
-        {/* Header */}
-        <div className="flex items-center justify-between mb-6 mt-2">
-          <div className="flex items-center gap-3">
-            <div className={`p-3 rounded-xl shadow-lg ${getStatusBarColor(pack.status)}`}>
-              <Battery className="h-6 w-6 text-white" />
+      <div className="bg-white rounded-xl border border-gray-200 shadow-sm hover:shadow-md transition-shadow duration-200 overflow-hidden">
+        {/* Thin accent bar */}
+        <div className={`h-0.5 ${accentColor}`} />
+
+        <div className="p-5">
+          {/* Header */}
+          <div className="flex items-center justify-between mb-5">
+            <div className="flex items-center gap-3">
+              <div className="h-10 w-10 rounded-lg bg-slate-100 flex items-center justify-center">
+                <Battery className="h-5 w-5 text-slate-600" />
+              </div>
+              <div>
+                <h3 className="text-base font-semibold text-gray-900">{pack.name}</h3>
+                <p className="text-xs text-gray-400 font-mono">{pack.id}</p>
+              </div>
             </div>
-            <div>
-              <h3 className="text-lg font-bold text-gray-900">{pack.name}</h3>
-              <p className="text-sm text-gray-500 font-mono">{pack.id}</p>
-            </div>
+            <StatusBadge status={pack.status} />
           </div>
-          <StatusBadge status={pack.status} />
-        </div>
 
-        {/* Metrics Grid */}
-        <div className="grid grid-cols-2 gap-4 mb-6">
-          {[
-            { label: 'State of Charge', value: pack.soc, icon: Battery },
-            { label: 'State of Health', value: pack.soh, icon: TrendingUp }
-          ].map(({ label, value, icon: Icon }) => (
-            <div key={label} className="space-y-2">
-              <div className="flex items-center gap-2">
-                <Icon className="h-4 w-4 text-gray-500" />
-                <span className="text-sm font-medium text-gray-600">{label}</span>
+          {/* SOC / SOH */}
+          <div className="grid grid-cols-2 gap-5 mb-5">
+            {[
+              { label: 'SOC', value: pack.soc, barColor: socColor },
+              { label: 'SOH', value: pack.soh, barColor: sohColor }
+            ].map(({ label, value, barColor }) => (
+              <div key={label}>
+                <div className="flex items-baseline justify-between mb-1.5">
+                  <span className="text-xs font-medium text-gray-400 uppercase tracking-wide">{label}</span>
+                  <span className="text-xl font-bold text-gray-900">{value}%</span>
+                </div>
+                <div className="w-full bg-gray-100 rounded-full h-1.5">
+                  <div className={`${barColor} h-1.5 rounded-full transition-all duration-300`} style={{ width: `${value}%` }} />
+                </div>
               </div>
-              <div className="text-3xl font-bold text-gray-900">{value}%</div>
-              <div className="w-full bg-gray-200 rounded-full h-3">
-                <div 
-                  className="bg-blue-500 h-3 rounded-full transition-all duration-300" 
-                  style={{ width: `${value}%` }}
-                />
+            ))}
+          </div>
+
+          {/* Electrical readings */}
+          <div className="grid grid-cols-3 gap-3 mb-5">
+            {[
+              { label: 'Voltage', value: pack.voltage, unit: 'V' },
+              { label: 'Current', value: pack.current, unit: 'A' },
+              { label: 'Temp', value: pack.temp, unit: '°C' }
+            ].map(({ label, value, unit }) => (
+              <div key={label} className="bg-gray-50 rounded-lg px-3 py-2.5 text-center">
+                <div className="text-base font-bold text-gray-900">{value}<span className="text-xs font-normal text-gray-400 ml-0.5">{unit}</span></div>
+                <div className="text-[10px] text-gray-400 font-medium uppercase tracking-wider mt-0.5">{label}</div>
               </div>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
 
-        {/* Electrical Properties */}
-        <div className="grid grid-cols-3 gap-4 p-4 bg-white/50 rounded-xl border border-gray-200 mb-6">
-          {[
-            { label: 'Voltage', value: pack.voltage, unit: 'V', icon: Zap, color: 'text-blue-500' },
-            { label: 'Current', value: pack.current, unit: 'A', icon: Activity, color: 'text-green-500' },
-            { label: 'Temp', value: pack.temp, unit: '°C', icon: Thermometer, color: 'text-orange-500' }
-          ].map(({ label, value, unit, icon: Icon, color }) => (
-            <div key={label} className="text-center space-y-1">
-              <Icon className={`h-5 w-5 ${color} mx-auto`} />
-              <div className="text-lg font-bold text-gray-900">{value}</div>
-              <div className="text-xs text-gray-500 font-medium">{label} ({unit})</div>
-            </div>
-          ))}
-        </div>
+          {/* Cell grid */}
+          <BatteryGrid cells={pack.cells} config={pack.config} series={pack.series} parallel={pack.parallel} />
 
-        <BatteryGrid cells={pack.cells} />
-
-        {/* Footer */}
-        <div className="flex items-center justify-between pt-4 mt-4 border-t border-gray-200">
-          <div className="flex items-center gap-2 text-xs text-gray-500">
+          {/* Footer */}
+          <div className="flex items-center gap-1.5 mt-4 pt-3 border-t border-gray-100 text-[11px] text-gray-400">
             <Clock className="h-3 w-3" />
-            <span>Updated: {currentTime.toLocaleTimeString('en-US', { 
-              hour: '2-digit', 
-              minute: '2-digit', 
-              second: '2-digit',
-              hour12: true 
-            })}</span>
+            <span>{currentTime.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true })}</span>
           </div>
         </div>
       </div>
@@ -511,14 +664,14 @@ const Dashboard = () => {
             {['safe', 'caution', 'alert'].map((status) => {
               const count = batteryPacks.filter(p => p.status === status).length;
               const colors = {
-                safe: 'bg-green-500',
-                caution: 'bg-yellow-500',
-                alert: 'bg-red-500'
+                safe: 'bg-emerald-500',
+                caution: 'bg-amber-500',
+                alert: 'bg-rose-500'
               };
               return (
-                <div key={status} className="flex items-center gap-2">
-                  <div className={`w-3 h-3 ${colors[status]} rounded-full`}></div>
-                  <span className="text-gray-600">
+                <div key={status} className="flex items-center gap-1.5">
+                  <div className={`w-2 h-2 ${colors[status]} rounded-full`}></div>
+                  <span className="text-gray-500 text-xs">
                     {status.charAt(0).toUpperCase() + status.slice(1)} ({count})
                   </span>
                 </div>
@@ -536,9 +689,18 @@ const Dashboard = () => {
             ))
           }
           {!loading && !error && batteryPacks.length === 0 && (
-            <p className="text-gray-500 col-span-2 text-center py-8">
-              No battery pack data available. Waiting for data...
-            </p>
+            <div className="col-span-2 text-center py-12">
+              <Battery className="h-12 w-12 text-gray-300 mx-auto mb-4" />
+              <p className="text-gray-500 mb-2">No battery packs yet</p>
+              <p className="text-sm text-gray-400 mb-4">Click the + button to register your first battery pack</p>
+              <button
+                onClick={() => setShowAddPack(true)}
+                className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition"
+              >
+                <Plus className="h-4 w-4" />
+                Add Pack
+              </button>
+            </div>
           )}
         </div>
       </div>
@@ -582,8 +744,56 @@ const Dashboard = () => {
             >
               <RefreshCw className="h-5 w-5 text-gray-600" />
             </button>
+            {user && (
+              <div className="flex items-center gap-3 pl-3 border-l border-gray-200">
+                <span className="text-sm font-medium text-gray-700">
+                  {user.first_name} {user.last_name}
+                </span>
+                <button
+                  onClick={handleLogout}
+                  className="flex items-center gap-1 px-3 py-1.5 text-sm text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                  title="Log out"
+                >
+                  <LogOut className="h-4 w-4" />
+                  Logout
+                </button>
+              </div>
+            )}
           </div>
         </div>
+
+        {/* Registered Packs Bar */}
+        {userPacks.length > 0 && (
+          <div className="mb-6 bg-white rounded-lg p-4 shadow-sm border border-gray-200">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold text-gray-700">Your Battery Packs</h3>
+              <button
+                onClick={() => setShowAddPack(true)}
+                className="flex items-center gap-1 px-3 py-1 text-xs font-medium text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+              >
+                <Plus className="h-3 w-3" />
+                Add Pack
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {userPacks.map((pack) => (
+                <div key={pack.id} className="flex items-center gap-2 px-3 py-1.5 bg-gray-50 rounded-lg border border-gray-200 text-sm">
+                  <Battery className="h-3.5 w-3.5 text-blue-500" />
+                  <span className="font-medium text-gray-700">{pack.name}</span>
+                  <span className="text-gray-400 text-xs">({pack.series_count}S{pack.parallel_count}P)</span>
+                  <button
+                    onClick={() => handleDeletePack(pack.id)}
+                    disabled={deletingPackId === pack.id}
+                    className="ml-1 p-0.5 text-gray-400 hover:text-red-500 transition-colors"
+                    title="Remove pack"
+                  >
+                    <Trash2 className="h-3 w-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Dashboard Tabs */}
         <Tabs defaultValue="summary" className="w-full">
@@ -639,6 +849,25 @@ const Dashboard = () => {
           </TabsContent>
         </Tabs>
       </div>
+
+      {/* Floating Add Pack Button */}
+      <button
+        onClick={() => setShowAddPack(true)}
+        className="fixed bottom-8 right-8 h-14 w-14 bg-blue-600 hover:bg-blue-700 text-white rounded-full shadow-lg hover:shadow-xl transition-all flex items-center justify-center z-40"
+        title="Add battery pack"
+      >
+        <Plus className="h-6 w-6" />
+      </button>
+
+      {/* Add Pack Modal */}
+      <AddPackModal
+        isOpen={showAddPack}
+        onClose={() => setShowAddPack(false)}
+        onPackCreated={() => {
+          fetchUserPacks();
+          setRefreshKey(k => k + 1);
+        }}
+      />
     </div>
   );
 };
