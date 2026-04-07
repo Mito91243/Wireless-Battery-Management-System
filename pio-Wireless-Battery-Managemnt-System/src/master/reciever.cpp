@@ -3,6 +3,7 @@
 #include <PubSubClient.h>
 #include <esp_wifi.h>
 #include "config.h"
+#include "BatteryEKF.h"
 
 // ==================== QUEUE TYPES ====================
 typedef struct
@@ -53,6 +54,12 @@ bool dequeueMessage(QueuedMessage &msg)
   portEXIT_CRITICAL(&queueMux);
   return true;
 }
+
+// ==================== EKF (one per sender) ====================
+// MAX_SENDERS must be >= NUM_SENDERS; one EKF per pack, 500 ms sample time
+#define MAX_SENDERS 4
+BatteryEKF ekf[MAX_SENDERS] = { BatteryEKF(0.5f), BatteryEKF(0.5f), BatteryEKF(0.5f), BatteryEKF(0.5f) };
+bool ekfInitialized[MAX_SENDERS] = { false };
 
 // ==================== STATE MANAGEMENT ====================
 unsigned long lastWiFiCheck = 0;
@@ -156,7 +163,7 @@ void connectMqtt()
   }
 }
 
-String buildJsonPayload(int senderIndex, const DeviceMessage &data)
+String buildJsonPayload(int senderIndex, const DeviceMessage &data, float soc)
 {
   String json = "{";
   json += "\"senderIndex\":" + String(senderIndex + 1) + ",";
@@ -180,17 +187,18 @@ String buildJsonPayload(int senderIndex, const DeviceMessage &data)
   json += "\"temp3\":" + String(data.temp3) + ",";
   json += "\"isCharging\":" + String(data.isCharging ? "true" : "false") + ",";
   json += "\"isDischarging\":" + String(data.isDischarging ? "true" : "false") + ",";
+  json += "\"soc\":" + String(soc, 1) + ",";
   json += "\"message\":\"" + String(data.message) + "\"";
   json += "}";
   return json;
 }
 
-bool publishToMqtt(int senderIndex, const DeviceMessage &data)
+bool publishToMqtt(int senderIndex, const DeviceMessage &data, float soc)
 {
   if (!mqtt.connected())
     return false;
 
-  String payload = buildJsonPayload(senderIndex, data);
+  String payload = buildJsonPayload(senderIndex, data, soc);
   bool ok = mqtt.publish(MQTT_TOPIC, payload.c_str());
 
   if (ok)
@@ -228,12 +236,30 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len)
   tempData.message[sizeof(tempData.message) - 1] = '\0';
 
   int senderIndex = findSenderIndex(mac_addr);
+  String senderMac = macToString(mac_addr);
+
+  Serial.printf("[ESP-NOW] 📥 Received %d bytes from %s (Sender %d)\n", len, senderMac.c_str(), senderIndex + 1);
+  Serial.printf("[ESP-NOW]   Cells: ");
+  for (int i = 0; i < CONNECTED_CELLS; i++)
+  {
+    Serial.printf("V%d=%umV ", i + 1, tempData.v[i]);
+  }
+  Serial.println();
+  Serial.printf("[ESP-NOW]   Stack=%umV Pack=%umV Current=%dmA\n", tempData.v_stack, tempData.v_pack, tempData.current);
+  Serial.printf("[ESP-NOW]   Temps: chip=%.1fC t1=%.1fC t2=%.1fC t3=%.1fC\n", tempData.chip_temp, tempData.temp1, tempData.temp2, tempData.temp3);
+  Serial.printf("[ESP-NOW]   Charge=%.1fAh Time=%us Charging=%d Discharging=%d\n", tempData.charge, tempData.charge_time, tempData.isCharging, tempData.isDischarging);
+  Serial.printf("[ESP-NOW]   Message: %s\n", tempData.message);
+
   if (senderIndex != -1)
   {
     if (enqueueMessage(tempData, senderIndex))
     {
-      Serial.printf("[ESP-NOW] Queued data from Sender %d\n", senderIndex + 1);
+      Serial.printf("[ESP-NOW] ✅ Queued data from Sender %d\n", senderIndex + 1);
     }
+  }
+  else
+  {
+    Serial.printf("[ESP-NOW] ⚠️ Unknown sender MAC: %s\n", senderMac.c_str());
   }
 }
 
@@ -284,7 +310,31 @@ void loop()
   if (dequeueMessage(qMsg))
   {
     Serial.println("[Queue] Processing BMS data...");
-    publishToMqtt(qMsg.senderIndex, qMsg.data);
+
+    int idx = qMsg.senderIndex;
+    if (idx >= 0 && idx < MAX_SENDERS)
+    {
+      // Use cell 1 voltage for EKF (matches testboard updateEKF pattern)
+      float cellV = (float)qMsg.data.v[0] / 1000.0f;  // mV -> V
+
+      float currentA = qMsg.data.current / 1000.0f;  // mA -> A
+
+      if (!ekfInitialized[idx])
+      {
+        // Bootstrap SoC from OCV (assumes pack is roughly at rest on first reading)
+        float initSoc = ekf[idx].invertOCV_Discharge(cellV);
+        ekf[idx].begin(initSoc);
+        ekfInitialized[idx] = true;
+        Serial.printf("[EKF] Sender %d initialized at SoC=%.1f%%\n", idx + 1, initSoc);
+      }
+
+      ekf[idx].update(currentA, cellV);
+      float soc = ekf[idx].getSOC();
+      Serial.printf("[EKF] Sender %d: SoC=%.1f%% (V_err=%.1fmV)\n",
+                    idx + 1, soc, ekf[idx].getVoltageError() * 1000.0f);
+
+      publishToMqtt(idx, qMsg.data, soc);
+    }
   }
   delay(10);
 }

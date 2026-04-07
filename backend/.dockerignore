@@ -1,7 +1,6 @@
 .venv/
 __pycache__/
 *.pyc
-*.pyo
-*.log
-.env
 *.db
+.env
+.git

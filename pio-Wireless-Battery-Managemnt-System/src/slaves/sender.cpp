@@ -106,7 +106,10 @@ void setup()
   bms.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   bms.reset();
   delay(100);
-  bms.setConnectedCells(CONNECTED_CELLS);
+  // Cells 1, 2 are on VC1/VC2; 3rd cell is on VC16
+  // Write bitmask directly: bits 0,1 (VC1,VC2) + bit 15 (VC16) = 0x8003
+  uint16_t cellMask = 0x8003;
+  bms.writeIntToMemory(0x9304, cellMask);
   bms.writeByteToMemory(DA_Configuration, 0x06); // Required for real BQ76952
 
   WiFi.mode(WIFI_STA);

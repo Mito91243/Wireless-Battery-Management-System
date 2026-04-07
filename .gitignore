@@ -30,6 +30,9 @@ yarn-error.log*
 coverage/
 *.lcov
 
+# Docker
+*.db
+
 # Dependencies
 node_modules/
 

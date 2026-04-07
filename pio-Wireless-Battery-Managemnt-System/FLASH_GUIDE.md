@@ -18,7 +18,7 @@ python scripts/get_mac.py
 Slave reads BMS data, sends via ESP-NOW to Master, which publishes to MQTT.
 
 ### Wiring
-- BQ76952 IC connected to Slave ESP32 via I2C (SDA=GPIO8, SCL=GPIO9)
+- BQ76952 IC connected to Slave ESP32 via I2C (SDA=GPIO21, SCL=GPIO22)
 - No wires between the two ESPs (wireless via ESP-NOW)
 
 ### Flash

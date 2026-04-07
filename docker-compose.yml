@@ -1,0 +1,29 @@
+services:
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    volumes:
+      - db-data:/app/data
+    environment:
+      - DATABASE_URL=sqlite:////app/data/wbms.db
+      - MQTT_BROKER=3.110.221.59
+      - MQTT_PORT=1883
+      - MQTT_TOPIC=bms/data
+      - FRONTEND_ORIGIN=http://localhost
+      - CONNECTED_CELLS=13
+      - PARALLEL_COUNT=4
+    # No ports exposed — only reachable via the frontend Nginx proxy
+    # To access API docs directly, uncomment:
+    # ports:
+    #   - "8000:8000"
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+
+volumes:
+  db-data:
