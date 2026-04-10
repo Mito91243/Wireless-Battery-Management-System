@@ -1,4 +1,3 @@
-import "./App.css";
 import Dashboard from "./pages/Dashboard";
 import { Route, Routes } from "react-router-dom";
 import Header from "./components/Header";
@@ -28,7 +27,7 @@ function App() {
         <Route path="/features" element={<FeaturesPage />} />
         <Route path="/documentation" element={<DocumentationPage />} />
         <Route path="/" element={<HomePage />} />
-        <Route path="*" element={<FeaturesPage />} />
+        <Route path="*" element={<HomePage />} />
       </Routes>
     </>
   );

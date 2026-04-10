@@ -1,10 +1,10 @@
 import { Upload, Battery, Radio, Zap, CheckCircle } from "lucide-react";
 import { Link } from "react-router-dom";
-import React, { useState } from 'react';
+import { useAuth } from "../context/AuthContext";
 
 
 export default function HomePage() {
-  const [isLoggedin, setLoggedin] = useState(null);
+  const { isAuthenticated } = useAuth();
 
   const features = [
     {
@@ -65,14 +65,16 @@ export default function HomePage() {
           </p>
 
           <div className="flex flex-col sm:flex-row gap-4 justify-center items-center">
-            <Link to= {isLoggedin ? "/dashboard" : "/login"}>
+            <Link to={isAuthenticated ? "/dashboard" : "/login"}>
               <button className="px-8 py-3 bg-gray-900 text-white font-semibold rounded-lg hover:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-offset-2 transition duration-200">
                 View Prototype
               </button>
             </Link>
-            <button className="px-8 py-3 bg-white text-gray-700 font-semibold rounded-lg border border-gray-300 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-offset-2 transition duration-200">
-              Learn More
-            </button>
+            <Link to="/documentation">
+              <button className="px-8 py-3 bg-white text-gray-700 font-semibold rounded-lg border border-gray-300 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-offset-2 transition duration-200">
+                Learn More
+              </button>
+            </Link>
           </div>
         </div>
       </section>

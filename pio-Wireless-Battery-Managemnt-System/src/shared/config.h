@@ -12,7 +12,7 @@ const uint32_t WIFI_TIMEOUT_MS = 15000;
 const uint32_t WIFI_RETRY_INTERVAL_MS = 10000;
 
 // ==================== MQTT CONFIG ====================
-const char *const MQTT_BROKER = "172.20.10.2";
+const char *const MQTT_BROKER = "64.23.174.210";
 const uint16_t MQTT_PORT = 1883;
 const char *const MQTT_TOPIC = "bms/data";
 const char *const MQTT_CLIENT_ID = "wbms-master";

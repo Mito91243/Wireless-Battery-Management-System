@@ -8,7 +8,7 @@ An embedded IoT system that monitors a multi-cell lithium battery pack in real t
 
 ```
 BQ76952 BMS IC ──(I2C)──► Slave ESP32 ──(ESP-NOW)──► Master ESP32 ──(MQTT/WiFi)──► Cloud Broker
-  (16-cell monitor)         sender.cpp                  reciever.cpp            3.110.221.59:1883
+  (16-cell monitor)         sender.cpp                  reciever.cpp            64.23.174.210:1883
 ```
 
 ### Data Flow (step by step)
@@ -18,7 +18,7 @@ BQ76952 BMS IC ──(I2C)──► Slave ESP32 ──(ESP-NOW)──► Master 
 3. Slave transmits the struct over **ESP-NOW** (peer-to-peer, MAC-addressed, ~250 byte payload)
 4. **Master ESP32** (`reciever.cpp`) receives ESP-NOW data in an ISR-like callback, enqueues it into a thread-safe circular queue
 5. Master's main loop dequeues messages, serializes to JSON, and publishes to MQTT topic `bms/data`
-6. Cloud broker at `3.110.221.59:1883` receives the data for dashboarding/storage
+6. Cloud broker at `64.23.174.210:1883` receives the data for dashboarding/storage
 
 ### Node Roles
 
@@ -101,7 +101,7 @@ typedef struct {
 |-------|----------|---------|
 | BMS IC <-> Slave | I2C | Address `0x08`, pins GPIO 21 (SDA) / GPIO 22 (SCL) |
 | Slave <-> Master | ESP-NOW | MAC-addressed, unencrypted, channel synced to WiFi AP |
-| Master <-> Cloud | MQTT | Broker at `3.110.221.59:1883`, topic `bms/data`, client ID `wbms-master` |
+| Master <-> Cloud | MQTT | Broker at `64.23.174.210:1883`, topic `bms/data`, client ID `wbms-master` |
 | Debug | UART | 115200 baud on both nodes |
 
 ## Configuration (config.h)
@@ -114,7 +114,7 @@ All configuration constants are in `src/shared/config.h`:
 | WiFi Password | `WIFI_PASSWORD` | `"ka159321"` | Hardcoded |
 | WiFi Timeout | `WIFI_TIMEOUT_MS` | 15000 ms | Initial connection timeout |
 | WiFi Retry Interval | `WIFI_RETRY_INTERVAL_MS` | 10000 ms | Reconnection check interval |
-| MQTT Broker | `MQTT_BROKER` | `"3.110.221.59"` | Plain MQTT, no TLS |
+| MQTT Broker | `MQTT_BROKER` | `"64.23.174.210"` | Plain MQTT, no TLS |
 | MQTT Port | `MQTT_PORT` | 1883 | Standard MQTT port |
 | MQTT Topic | `MQTT_TOPIC` | `"bms/data"` | Publish topic for BMS telemetry |
 | MQTT Client ID | `MQTT_CLIENT_ID` | `"wbms-master"` | Must be unique per device |

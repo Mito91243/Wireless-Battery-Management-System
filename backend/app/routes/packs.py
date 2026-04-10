@@ -2,6 +2,7 @@ import random
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user
@@ -88,12 +89,26 @@ def get_latest_pack_data(
             temp = f"{latest_reading.temperature:.2f}"
             power = latest_reading.power or (latest_reading.v_real * latest_reading.current)
 
-            # Get cell voltages from DB
+            # Get latest voltage per cell position (correlated subquery to
+            # avoid picking multiple rows from the same cell when several
+            # readings share a timestamp or arrive in bursts).
+            latest_per_cell = (
+                db.query(
+                    BatteryReading.battery_position.label("pos"),
+                    func.max(BatteryReading.timestamp).label("max_ts"),
+                )
+                .filter(BatteryReading.pack_id == pack.id)
+                .group_by(BatteryReading.battery_position)
+                .subquery()
+            )
             cell_readings = (
                 db.query(BatteryReading)
+                .join(
+                    latest_per_cell,
+                    (BatteryReading.battery_position == latest_per_cell.c.pos)
+                    & (BatteryReading.timestamp == latest_per_cell.c.max_ts),
+                )
                 .filter(BatteryReading.pack_id == pack.id)
-                .order_by(BatteryReading.timestamp.desc())
-                .limit(total_cells)
                 .all()
             )
 
@@ -106,6 +121,8 @@ def get_latest_pack_data(
                 # Pad if not enough cell readings
                 while len(cells) < total_cells:
                     cells.append({"value": "0.00", "status": "safe"})
+                # Truncate if pack was shrunk
+                cells = cells[:total_cells]
             else:
                 cells = _mock_cells(total_cells)
 
