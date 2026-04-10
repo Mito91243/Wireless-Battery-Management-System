@@ -1,16 +1,22 @@
-from typing import List
+import logging
+import os
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
 from app.models.database import engine, Base
+from app.mqtt_subscriber import start_mqtt, stop_mqtt
 from app.routes.auth import router as auth_router
 from app.routes.packs import router as packs_router
 
 # Import models so Base knows about them
 from app.models import models  # noqa: F401
+
+logging.basicConfig(
+    level=os.getenv("WBMS_LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 app = FastAPI(title="WBMS Backend", version="1.0.0")
 
@@ -21,10 +27,25 @@ def on_startup():
         Base.metadata.create_all(bind=engine)
     except Exception as e:
         print(f"Warning: Could not create tables on startup: {e}")
+    start_mqtt()
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    stop_mqtt()
+
+
+# CORS — allow the configured frontend origin plus local dev hosts.
+_frontend_origin = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+_allowed_origins = {
+    _frontend_origin,
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+}
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=sorted(_allowed_origins),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,60 +56,14 @@ app.include_router(auth_router)
 app.include_router(packs_router)
 
 
-# --- Legacy / utility endpoints ---
-
-class ESP32Data(BaseModel):
-    senderIndex: int
-    sensorValue: float
-    buttonState: bool
-    message: str
-
-
-class SensorReading(BaseModel):
-    senderIndex: int
-    sensorValue: float
-    buttonState: bool
-    message: str
-    timestamp: str
-
-
-sensor_readings: List[SensorReading] = []
-
-
 @app.get("/")
 async def root():
     return {"message": "WBMS API"}
-
-
-@app.post("/v1/sensor-data")
-async def receive_sensor_data(data: ESP32Data):
-    try:
-        new_reading = SensorReading(
-            senderIndex=data.senderIndex,
-            sensorValue=data.sensorValue,
-            buttonState=data.buttonState,
-            message=data.message,
-            timestamp=datetime.now().replace(microsecond=0).isoformat(),
-        )
-        sensor_readings.append(new_reading)
-
-        if len(sensor_readings) > 1000:
-            sensor_readings.pop(0)
-
-        return {
-            "status": "success",
-            "message": "Data received successfully",
-            "received_at": new_reading.timestamp,
-        }
-    except Exception as e:
-        print(f"Error processing data: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "Healthy",
-        "total_readings": len(sensor_readings),
         "timestamp": datetime.now().isoformat(),
     }
