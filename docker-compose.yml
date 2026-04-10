@@ -9,7 +9,7 @@ services:
       - MQTT_BROKER=3.110.221.59
       - MQTT_PORT=1883
       - MQTT_TOPIC=bms/data
-      - FRONTEND_ORIGIN=http://localhost
+      - FRONTEND_ORIGIN=https://wbms.systems
       - CONNECTED_CELLS=13
       - PARALLEL_COUNT=4
     # No ports exposed — only reachable via the frontend Nginx proxy
@@ -21,7 +21,7 @@ services:
     build: ./frontend
     restart: unless-stopped
     ports:
-      - "80:80"
+      - "127.0.0.1:8080:80"
     depends_on:
       - backend
 
