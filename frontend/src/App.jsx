@@ -7,6 +7,7 @@ import SignInComponent from "./pages/Login";
 import AboutPage from "./pages/About";
 import FeaturesPage from "./pages/Features";
 import HomePage from "./pages/Home";
+import DocumentationPage from "./pages/Documentation";
 import ProtectedRoute from "./components/ProtectedRoute";
 import { useLocation } from "react-router-dom";
 
@@ -25,6 +26,7 @@ function App() {
         <Route path="/login" element={<SignInComponent />} />
         <Route path="/about" element={<AboutPage />} />
         <Route path="/features" element={<FeaturesPage />} />
+        <Route path="/documentation" element={<DocumentationPage />} />
         <Route path="/" element={<HomePage />} />
         <Route path="*" element={<FeaturesPage />} />
       </Routes>

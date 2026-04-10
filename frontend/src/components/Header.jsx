@@ -328,13 +328,19 @@ export default function Header() {
         </nav>
         {close ? (
           <div className="lg:hidden" role="dialog" aria-modal="true">
-            <div className="fixed inset-0 z-10"></div>{" "}
-            <div className="fixed inset-y-0 right-0 z-10 w-full overflow-y-auto bg-white px-6 py-6 sm:max-w-sm sm:ring-1 sm:ring-gray-900/10">
+            <div
+              className="fixed inset-0 z-10 bg-black/20"
+              onClick={() => setisClosed(false)}
+            ></div>{" "}
+            <div className="fixed inset-y-0 right-0 z-20 w-full overflow-y-auto bg-white px-6 py-6 sm:max-w-sm sm:ring-1 sm:ring-gray-900/10">
               <div className="flex items-center justify-between">
-                <a href="#" className="-m-1.5 p-1.5">
-                  <span className="sr-only">Your Company</span>
-                  <img className="h-8 w-auto" src="/Logo.jpg" alt="" />
-                </a>
+                <Link
+                  to="/"
+                  className="-m-1.5 p-1.5"
+                  onClick={() => setisClosed(false)}
+                >
+                  <span className="text-xl font-bold text-blue-600">WBMS</span>
+                </Link>
                 <button
                   type="button"
                   className="-m-2.5 rounded-md p-2.5 text-gray-700" ////////////////////
@@ -429,32 +435,66 @@ export default function Header() {
                         </div>
                       ) : null}
                     </div>
-                    <a
-                      href="#"
+                    <Link
+                      to="/features"
+                      onClick={() => setisClosed(false)}
                       className="-mx-3 block rounded-lg px-3 py-2 text-base font-semibold leading-7 text-gray-900 hover:bg-gray-50"
                     >
                       Features
-                    </a>
-                    <a
-                      href="#"
+                    </Link>
+                    <Link
+                      to="/about"
+                      onClick={() => setisClosed(false)}
                       className="-mx-3 block rounded-lg px-3 py-2 text-base font-semibold leading-7 text-gray-900 hover:bg-gray-50"
                     >
-                      Marketplace
-                    </a>
-                    <a
-                      href="#"
+                      About Us
+                    </Link>
+                    <Link
+                      to="/documentation"
+                      onClick={() => setisClosed(false)}
                       className="-mx-3 block rounded-lg px-3 py-2 text-base font-semibold leading-7 text-gray-900 hover:bg-gray-50"
                     >
-                      Company
-                    </a>
+                      Documentation
+                    </Link>
                   </div>
-                  <div className="py-6">
-                    <a
-                      href="#"
-                      className="-mx-3 block rounded-lg px-3 py-2.5 text-base font-semibold leading-7 text-gray-900 hover:bg-gray-50"
-                    >
-                      Log in
-                    </a>
+                  <div className="py-6 space-y-2">
+                    {isAuthenticated ? (
+                      <>
+                        <Link
+                          to="/dashboard"
+                          onClick={() => setisClosed(false)}
+                          className="-mx-3 block rounded-lg px-3 py-2.5 text-base font-semibold leading-7 text-gray-900 hover:bg-gray-50"
+                        >
+                          Dashboard
+                        </Link>
+                        <button
+                          onClick={() => {
+                            setisClosed(false);
+                            handleLogout();
+                          }}
+                          className="-mx-3 block w-full text-left rounded-lg px-3 py-2.5 text-base font-semibold leading-7 text-gray-900 hover:bg-gray-50"
+                        >
+                          Log out
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <Link
+                          to="/signup"
+                          onClick={() => setisClosed(false)}
+                          className="-mx-3 block rounded-lg px-3 py-2.5 text-base font-semibold leading-7 text-gray-900 hover:bg-gray-50"
+                        >
+                          Sign up
+                        </Link>
+                        <Link
+                          to="/login"
+                          onClick={() => setisClosed(false)}
+                          className="-mx-3 block rounded-lg px-3 py-2.5 text-base font-semibold leading-7 text-gray-900 hover:bg-gray-50"
+                        >
+                          Log in
+                        </Link>
+                      </>
+                    )}
                   </div>
                 </div>
               </div>
