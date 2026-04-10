@@ -1,3 +1,4 @@
+import logging
 import os
 from datetime import datetime
 
@@ -5,11 +6,17 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.models.database import engine, Base
+from app.mqtt_subscriber import start_mqtt, stop_mqtt
 from app.routes.auth import router as auth_router
 from app.routes.packs import router as packs_router
 
 # Import models so Base knows about them
 from app.models import models  # noqa: F401
+
+logging.basicConfig(
+    level=os.getenv("WBMS_LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 app = FastAPI(title="WBMS Backend", version="1.0.0")
 
@@ -20,6 +27,12 @@ def on_startup():
         Base.metadata.create_all(bind=engine)
     except Exception as e:
         print(f"Warning: Could not create tables on startup: {e}")
+    start_mqtt()
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    stop_mqtt()
 
 
 # CORS — allow the configured frontend origin plus local dev hosts.

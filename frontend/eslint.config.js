@@ -23,7 +23,17 @@ export default defineConfig([
       },
     },
     rules: {
-      'no-unused-vars': ['error', { varsIgnorePattern: '^[A-Z_]' }],
+      'no-unused-vars': [
+        'error',
+        {
+          // Capitalized identifiers are typically React components used in
+          // JSX, which eslint can't see without eslint-plugin-react. Ignore
+          // them in both let/const declarations and function arguments
+          // (e.g. `({ icon: Icon })`).
+          varsIgnorePattern: '^[A-Z_]',
+          argsIgnorePattern: '^[A-Z_]',
+        },
+      ],
     },
   },
 ])
