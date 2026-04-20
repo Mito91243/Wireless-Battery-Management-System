@@ -2,7 +2,7 @@
 from sqlalchemy import Boolean, Column, Integer, String, Float, DateTime, ForeignKey, Index
 from sqlalchemy.orm import relationship
 from app.models.database import Base
-from datetime import datetime
+from datetime import datetime, timezone
 
 class User(Base):
     __tablename__ = "users"
@@ -13,7 +13,7 @@ class User(Base):
     email = Column(String(255), unique=True, nullable=False, index=True)
     password = Column(String(255), nullable=False)
 
-    packs = relationship("Pack", back_populates="owner", cascade="all, delete-orphan")
+    packs = relationship("Pack", back_populates="owner")
 
 
 class Pack(Base):
@@ -22,14 +22,16 @@ class Pack(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(255), nullable=False, index=True)
     pack_identifier = Column(String(50), unique=True, nullable=False, index=True)
-    series_count = Column(Integer, nullable=False, default=13)
-    parallel_count = Column(Integer, nullable=False, default=4)
+    pairing_code = Column(String(10), unique=True, nullable=False, index=True)
+    series_count = Column(Integer, nullable=False, default=3)
+    parallel_count = Column(Integer, nullable=False, default=1)
     user_id = Column(
         Integer,
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
+    auto_created = Column(Boolean, default=False, nullable=False)
 
     owner = relationship("User", back_populates="packs")
     

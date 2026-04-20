@@ -46,6 +46,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 import paho.mqtt.client as mqtt
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.database import SessionLocal
@@ -63,7 +64,7 @@ MQTT_TOPIC = os.getenv("MQTT_TOPIC", "bms/data")
 MQTT_USERNAME = os.getenv("MQTT_USERNAME") or None
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD") or None
 MQTT_CLIENT_ID = os.getenv("MQTT_CLIENT_ID", "wbms-backend")
-MQTT_PACK_ID_TEMPLATE = os.getenv("MQTT_PACK_ID_TEMPLATE", "wbms-pack-{senderIndex}")
+CONNECTED_CELLS_DEFAULT = int(os.getenv("CONNECTED_CELLS", "3"))
 
 # Nominal LiFePO4/Li-ion SOC curve endpoints (volts per cell)
 _CELL_V_EMPTY = 3.0
@@ -72,24 +73,18 @@ _CELL_V_FULL = 4.2
 # Module-level client so start/stop can manage a single instance.
 _client: Optional[mqtt.Client] = None
 _client_lock = threading.Lock()
-_unknown_packs_warned: set[str] = set()
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _resolve_pack_identifier(payload: dict[str, Any]) -> Optional[str]:
-    explicit = payload.get("packId") or payload.get("pack_identifier")
-    if explicit:
-        return str(explicit)
-    sender_index = payload.get("senderIndex")
-    if sender_index is None:
-        return None
-    try:
-        return MQTT_PACK_ID_TEMPLATE.format(senderIndex=int(sender_index))
-    except (ValueError, KeyError):
-        return None
+def _resolve_pairing_code(payload: dict[str, Any]) -> Optional[str]:
+    """Extract the pairing code from the MQTT payload."""
+    code = payload.get("pairingCode")
+    if code and str(code) != "unknown":
+        return str(code).strip().upper()
+    return None
 
 
 def _estimate_soc(cell_voltages_v: list[float]) -> float:
@@ -205,29 +200,67 @@ def _handle_payload(raw: bytes) -> None:
         log.warning("Dropping non-object MQTT payload: %r", type(payload).__name__)
         return
 
-    pack_identifier = _resolve_pack_identifier(payload)
-    if not pack_identifier:
-        log.warning("MQTT payload has no packId or senderIndex: %r", payload)
+    pairing_code = _resolve_pairing_code(payload)
+    if not pairing_code:
+        log.warning("MQTT payload has no valid pairingCode: %r", payload)
         return
 
     db = SessionLocal()
     try:
         pack = (
-            db.query(Pack).filter(Pack.pack_identifier == pack_identifier).first()
+            db.query(Pack).filter(Pack.pairing_code == pairing_code).first()
         )
         if pack is None:
-            if pack_identifier not in _unknown_packs_warned:
-                _unknown_packs_warned.add(pack_identifier)
-                log.warning(
-                    "MQTT payload targets unknown pack_identifier=%r; create a pack "
-                    "with this identifier in the dashboard to start persisting data",
-                    pack_identifier,
+            # Auto-create pack from first MQTT message
+            connected_cells = CONNECTED_CELLS_DEFAULT
+            raw_cells = payload.get("connectedCells")
+            if raw_cells is not None:
+                try:
+                    connected_cells = max(1, min(16, int(raw_cells)))
+                except (TypeError, ValueError):
+                    pass
+
+            pack = Pack(
+                name=f"Pack {pairing_code}",
+                pack_identifier=f"wbms-{pairing_code.lower()}",
+                pairing_code=pairing_code,
+                series_count=connected_cells,
+                parallel_count=1,
+                user_id=None,
+                auto_created=True,
+            )
+            try:
+                db.add(pack)
+                db.commit()
+                db.refresh(pack)
+                log.info(
+                    "Auto-created pack %r (series=%d) from MQTT data",
+                    pairing_code, connected_cells,
                 )
-            return
+            except IntegrityError:
+                db.rollback()
+                pack = db.query(Pack).filter(Pack.pairing_code == pairing_code).first()
+                if pack is None:
+                    log.error("Race condition: could not create or find pack %r", pairing_code)
+                    return
+        else:
+            # Warn if firmware config changed
+            incoming_cells = payload.get("connectedCells")
+            if incoming_cells is not None:
+                try:
+                    incoming_cells = int(incoming_cells)
+                    if incoming_cells != pack.series_count:
+                        log.warning(
+                            "Pack %r has series_count=%d but firmware reports connectedCells=%d",
+                            pairing_code, pack.series_count, incoming_cells,
+                        )
+                except (TypeError, ValueError):
+                    pass
+
         _persist_reading(db, pack, payload)
     except Exception:
         db.rollback()
-        log.exception("Failed to persist MQTT reading for pack=%r", pack_identifier)
+        log.exception("Failed to persist MQTT reading for pack=%r", pairing_code)
     finally:
         db.close()
 

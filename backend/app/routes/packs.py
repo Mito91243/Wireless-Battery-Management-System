@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from app.auth import get_current_user
 from app.models.database import get_db
 from app.models.models import User, Pack, Reading, BatteryReading
-from app.models.schemas import PackCreate, PackResponse
+from app.models.schemas import PackCreate, PackClaim, PackResponse
 
 router = APIRouter(prefix="/v1/packs", tags=["packs"])
 
@@ -26,12 +26,15 @@ def create_pack(
             detail="A pack with this identifier already exists",
         )
 
+    pairing_code = pack_data.pairing_code or pack_data.pack_identifier.upper()
     pack = Pack(
         name=pack_data.name,
         pack_identifier=pack_data.pack_identifier,
+        pairing_code=pairing_code,
         series_count=pack_data.series_count,
         parallel_count=pack_data.parallel_count,
         user_id=current_user.id,
+        auto_created=False,
     )
     db.add(pack)
     db.commit()
@@ -45,6 +48,32 @@ def list_packs(
     db: Session = Depends(get_db),
 ):
     return db.query(Pack).filter(Pack.user_id == current_user.id).all()
+
+
+@router.post("/claim", response_model=PackResponse)
+def claim_pack(
+    claim_data: PackClaim,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    code = claim_data.pairing_code.strip().upper()
+    pack = db.query(Pack).filter(Pack.pairing_code == code).first()
+    if not pack:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No device found with this pairing code. Make sure your pack is powered on and connected.",
+        )
+    if pack.user_id is not None:
+        if pack.user_id == current_user.id:
+            return pack  # Already claimed by this user
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This pack is already claimed by another user",
+        )
+    pack.user_id = current_user.id
+    db.commit()
+    db.refresh(pack)
+    return pack
 
 
 @router.delete("/{pack_id}", status_code=status.HTTP_204_NO_CONTENT)

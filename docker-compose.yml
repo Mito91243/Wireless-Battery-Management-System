@@ -5,13 +5,16 @@ services:
     volumes:
       - db-data:/app/data
     environment:
-      - DATABASE_URL=sqlite:////app/data/wbms.db
+      - WBMS_DATABASE_URL=sqlite:////app/data/wbms.db
+      - WBMS_SECRET_KEY=ab608e384edf5a9032436c28d5989957c7f232e04066a9b8146212821ee97ac9
       - MQTT_BROKER=64.23.174.210
       - MQTT_PORT=1883
       - MQTT_TOPIC=bms/data
+      - MQTT_USERNAME=wbms-backend
+      - MQTT_PASSWORD=mito1234
       - FRONTEND_ORIGIN=https://wbms.systems
-      - CONNECTED_CELLS=13
-      - PARALLEL_COUNT=4
+      - CONNECTED_CELLS=3
+      - PARALLEL_COUNT=1
     # No ports exposed — only reachable via the frontend Nginx proxy
     # To access API docs directly, uncomment:
     # ports:

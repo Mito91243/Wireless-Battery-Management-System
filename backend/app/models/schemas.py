@@ -28,17 +28,24 @@ class UserResponse(BaseModel):
 class PackCreate(BaseModel):
     name: str
     pack_identifier: str
-    series_count: int = 13
-    parallel_count: int = 4
+    pairing_code: str = ""
+    series_count: int = 3
+    parallel_count: int = 1
+
+
+class PackClaim(BaseModel):
+    pairing_code: str
 
 
 class PackResponse(BaseModel):
     id: int
     name: str
     pack_identifier: str
+    pairing_code: str
     series_count: int
     parallel_count: int
-    user_id: int
+    user_id: Optional[int] = None
+    auto_created: bool = False
 
     class Config:
         from_attributes = True

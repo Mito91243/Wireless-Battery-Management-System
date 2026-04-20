@@ -1,5 +1,6 @@
 #include <esp_now.h>
 #include <WiFi.h>
+#include <WiFiManager.h>
 #include <PubSubClient.h>
 #include <esp_wifi.h>
 #include "config.h"
@@ -10,11 +11,9 @@ typedef struct
 {
   DeviceMessage data;
   int senderIndex;
-  bool hasData;
 } QueuedMessage;
 
 // ==================== QUEUE SYSTEM ====================
-#define QUEUE_SIZE 10
 QueuedMessage messageQueue[QUEUE_SIZE];
 volatile int queueHead = 0;
 volatile int queueTail = 0;
@@ -32,7 +31,6 @@ bool enqueueMessage(const DeviceMessage &data, int senderIndex)
   }
   messageQueue[queueHead].data = data;
   messageQueue[queueHead].senderIndex = senderIndex;
-  messageQueue[queueHead].hasData = true;
   queueHead = (queueHead + 1) % QUEUE_SIZE;
   queueCount++;
   portEXIT_CRITICAL(&queueMux);
@@ -48,7 +46,6 @@ bool dequeueMessage(QueuedMessage &msg)
     return false;
   }
   msg = messageQueue[queueTail];
-  messageQueue[queueTail].hasData = false;
   queueTail = (queueTail + 1) % QUEUE_SIZE;
   queueCount--;
   portEXIT_CRITICAL(&queueMux);
@@ -56,10 +53,8 @@ bool dequeueMessage(QueuedMessage &msg)
 }
 
 // ==================== EKF (one per sender) ====================
-// MAX_SENDERS must be >= NUM_SENDERS; one EKF per pack, 500 ms sample time
-#define MAX_SENDERS 4
-BatteryEKF ekf[MAX_SENDERS] = { BatteryEKF(0.5f), BatteryEKF(0.5f), BatteryEKF(0.5f), BatteryEKF(0.5f) };
-bool ekfInitialized[MAX_SENDERS] = { false };
+BatteryEKF ekf[NUM_SENDERS] = { BatteryEKF(EKF_SAMPLE_TIME) };
+bool ekfInitialized[NUM_SENDERS] = { false };
 
 // ==================== STATE MANAGEMENT ====================
 unsigned long lastWiFiCheck = 0;
@@ -80,28 +75,48 @@ String macToString(const uint8_t *mac)
 }
 
 // ==================== WIFI FUNCTIONS ====================
+WiFiManager wifiManager;
+
 bool initWiFi()
 {
-  Serial.printf("[WiFi] Connecting to: %s\n", WIFI_SSID);
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  unsigned long startAttempt = millis();
-
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < WIFI_TIMEOUT_MS)
+  // Hold BOOT button during startup to clear saved WiFi and re-enter setup portal
+  pinMode(WIFI_RESET_PIN, INPUT_PULLUP);
+  delay(100);
+  if (digitalRead(WIFI_RESET_PIN) == LOW)
   {
-    delay(500);
-    Serial.print(".");
+    Serial.println("[WiFi] 🔄 Reset button held — clearing saved credentials");
+    wifiManager.resetSettings();
   }
 
-  if (WiFi.status() == WL_CONNECTED)
+  WiFi.mode(WIFI_AP_STA);
+  wifiManager.setConfigPortalTimeout(180); // Portal stays open 3 minutes then gives up
+  wifiManager.setConnectTimeout(WIFI_TIMEOUT_MS / 1000);
+
+  Serial.println("[WiFi] Starting WiFi provisioning...");
+  Serial.println("[WiFi] If no saved network — connect your phone to 'WBMS-Setup' to configure");
+  bool connected = wifiManager.autoConnect("WBMS-Setup");
+
+  // Ensure AP_STA mode for ESP-NOW after WiFiManager may have changed it
+  WiFi.mode(WIFI_AP_STA);
+
+  if (connected)
   {
     currentChannel = WiFi.channel();
     esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
-    Serial.println("\n[WiFi] ✅ Connected!");
+    // Start discovery AP so slaves can find our channel
+    WiFi.softAP(MASTER_AP_SSID, NULL, currentChannel);
+    Serial.println("[WiFi] ✅ Connected!");
     Serial.printf("[WiFi] IP: %s, Channel: %d\n", WiFi.localIP().toString().c_str(), currentChannel);
+    Serial.printf("[WiFi] Discovery AP '%s' active on channel %d\n", MASTER_AP_SSID, currentChannel);
     return true;
   }
-  Serial.println("\n[WiFi] ❌ Connection Failed");
+
+  Serial.println("[WiFi] ❌ Portal timed out — running in ESP-NOW only mode");
+  // Still start discovery AP on fallback channel so slaves can sync
+  currentChannel = 6;
+  WiFi.softAP(MASTER_AP_SSID, NULL, currentChannel);
+  esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+  Serial.printf("[WiFi] Discovery AP '%s' on fallback channel %d\n", MASTER_AP_SSID, currentChannel);
   return false;
 }
 
@@ -131,11 +146,18 @@ void maintainWiFi()
     if (WiFi.status() != WL_CONNECTED)
     {
       Serial.println("[WiFi] Reconnecting...");
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      WiFi.reconnect(); // Uses credentials saved in NVS by WiFiManager
     }
     else
     {
-      updateESPNowChannel(WiFi.channel());
+      uint8_t newChannel = WiFi.channel();
+      if (newChannel != currentChannel)
+      {
+        updateESPNowChannel(newChannel);
+        // Keep discovery AP in sync with the new channel
+        WiFi.softAP(MASTER_AP_SSID, NULL, newChannel);
+        Serial.printf("[WiFi] Discovery AP moved to channel %d\n", newChannel);
+      }
     }
   }
 }
@@ -153,7 +175,7 @@ void connectMqtt()
   lastMqttReconnect = millis();
   Serial.printf("[MQTT] Connecting to %s:%d...\n", MQTT_BROKER, MQTT_PORT);
 
-  if (mqtt.connect(MQTT_CLIENT_ID))
+  if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD))
   {
     Serial.println("[MQTT] ✅ Connected!");
   }
@@ -165,8 +187,18 @@ void connectMqtt()
 
 String buildJsonPayload(int senderIndex, const DeviceMessage &data, float soc)
 {
+  // Extract pairing code from message field (format: "BMS:XXXXXX")
+  String pairingCode = "unknown";
+  String msg = String(data.message);
+  if (msg.startsWith("BMS:") && msg.length() >= 10)
+  {
+    pairingCode = msg.substring(4);
+  }
+
   String json = "{";
   json += "\"senderIndex\":" + String(senderIndex + 1) + ",";
+  json += "\"connectedCells\":" + String(CONNECTED_CELLS) + ",";
+  json += "\"pairingCode\":\"" + pairingCode + "\",";
 
   for (int i = 0; i < 16; i++)
   {
@@ -188,7 +220,7 @@ String buildJsonPayload(int senderIndex, const DeviceMessage &data, float soc)
   json += "\"isCharging\":" + String(data.isCharging ? "true" : "false") + ",";
   json += "\"isDischarging\":" + String(data.isDischarging ? "true" : "false") + ",";
   json += "\"soc\":" + String(soc, 1) + ",";
-  json += "\"message\":\"" + String(data.message) + "\"";
+  json += "\"message\":\"" + msg + "\"";
   json += "}";
   return json;
 }
@@ -312,7 +344,7 @@ void loop()
     Serial.println("[Queue] Processing BMS data...");
 
     int idx = qMsg.senderIndex;
-    if (idx >= 0 && idx < MAX_SENDERS)
+    if (idx >= 0 && idx < NUM_SENDERS)
     {
       // Use cell 1 voltage for EKF (matches testboard updateEKF pattern)
       float cellV = (float)qMsg.data.v[0] / 1000.0f;  // mV -> V

@@ -187,13 +187,48 @@ const TrendChart = React.memo(({ data, title, subtitle, dataKeys }) => (
 
 // Add Pack Modal Component
 const AddPackModal = ({ isOpen, onClose, onPackCreated }) => {
-  const [form, setForm] = useState({ name: '', pack_identifier: '', series_count: 13, parallel_count: 4 });
+  const [activeTab, setActiveTab] = useState('pair');
+  const [pairingCode, setPairingCode] = useState('');
+  const [form, setForm] = useState({ name: '', pack_identifier: '', pairing_code: '', series_count: 3, parallel_count: 1 });
   const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
   if (!isOpen) return null;
 
-  const handleSubmit = async (e) => {
+  const handlePair = async (e) => {
+    e.preventDefault();
+    const code = pairingCode.trim().toUpperCase();
+    if (!code) {
+      setError('Please enter a pairing code');
+      return;
+    }
+    setSubmitting(true);
+    setError('');
+    setSuccess('');
+    try {
+      const pack = await apiFetch('/v1/packs/claim', {
+        method: 'POST',
+        body: JSON.stringify({ pairing_code: code }),
+      });
+      setSuccess(`Paired successfully! "${pack.name}" added to your dashboard.`);
+      setPairingCode('');
+      onPackCreated();
+      setTimeout(() => { setSuccess(''); onClose(); }, 1500);
+    } catch (err) {
+      if (err.status === 404) {
+        setError('No device found with this pairing code. Make sure your pack is powered on and connected.');
+      } else if (err.status === 409) {
+        setError('This pack is already claimed by another user.');
+      } else {
+        setError(err.message || 'Failed to pair device');
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleManualSubmit = async (e) => {
     e.preventDefault();
     if (!form.name.trim() || !form.pack_identifier.trim()) {
       setError('Pack name and identifier are required');
@@ -207,11 +242,12 @@ const AddPackModal = ({ isOpen, onClose, onPackCreated }) => {
         body: JSON.stringify({
           name: form.name,
           pack_identifier: form.pack_identifier,
-          series_count: parseInt(form.series_count) || 13,
-          parallel_count: parseInt(form.parallel_count) || 4,
+          pairing_code: form.pairing_code || form.pack_identifier.toUpperCase(),
+          series_count: parseInt(form.series_count) || 3,
+          parallel_count: parseInt(form.parallel_count) || 1,
         }),
       });
-      setForm({ name: '', pack_identifier: '', series_count: 13, parallel_count: 4 });
+      setForm({ name: '', pack_identifier: '', pairing_code: '', series_count: 3, parallel_count: 1 });
       onPackCreated();
       onClose();
     } catch (err) {
@@ -226,70 +262,124 @@ const AddPackModal = ({ isOpen, onClose, onPackCreated }) => {
       <div className="bg-white rounded-xl shadow-2xl w-full max-w-md">
         <div className="flex items-center justify-between p-6 border-b border-gray-200">
           <h2 className="text-xl font-bold text-gray-900">Add Battery Pack</h2>
-          <button onClick={onClose} className="p-1 hover:bg-gray-100 rounded-lg">
+          <button onClick={() => { setError(''); setSuccess(''); onClose(); }} className="p-1 hover:bg-gray-100 rounded-lg">
             <X className="h-5 w-5 text-gray-500" />
           </button>
         </div>
-        <form onSubmit={handleSubmit} className="p-6 space-y-4">
-          {error && (
-            <div className="p-3 bg-red-50 border border-red-200 rounded-md text-sm text-red-600">{error}</div>
-          )}
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Pack Name</label>
-            <input
-              type="text"
-              value={form.name}
-              onChange={(e) => setForm(f => ({ ...f, name: e.target.value }))}
-              placeholder="e.g. Pack Alpha"
-              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-            />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Pack ID (Hardware Identifier)</label>
-            <input
-              type="text"
-              value={form.pack_identifier}
-              onChange={(e) => setForm(f => ({ ...f, pack_identifier: e.target.value }))}
-              placeholder="e.g. BP001 or sender index"
-              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-            />
-            <p className="mt-1 text-xs text-gray-500">This should match the hardware sender ID of your battery pack</p>
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Series Count</label>
-              <input
-                type="number"
-                min="1"
-                value={form.series_count}
-                onChange={(e) => setForm(f => ({ ...f, series_count: e.target.value }))}
-                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Parallel Count</label>
-              <input
-                type="number"
-                min="1"
-                value={form.parallel_count}
-                onChange={(e) => setForm(f => ({ ...f, parallel_count: e.target.value }))}
-                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-              />
-            </div>
-          </div>
-          <div className="p-3 bg-gray-50 rounded-lg text-sm text-gray-600">
-            Configuration: <span className="font-semibold">{form.series_count}S{form.parallel_count}P</span> ({(parseInt(form.series_count) || 0) * (parseInt(form.parallel_count) || 0)} cells)
-          </div>
+
+        {/* Tab switcher */}
+        <div className="flex border-b border-gray-200">
           <button
-            type="submit"
-            disabled={submitting}
-            className={`w-full py-3 px-4 rounded-md text-sm font-medium text-white transition ${
-              submitting ? 'bg-blue-300 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'
+            onClick={() => { setActiveTab('pair'); setError(''); setSuccess(''); }}
+            className={`flex-1 py-3 text-sm font-medium text-center transition ${
+              activeTab === 'pair' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-500 hover:text-gray-700'
             }`}
           >
-            {submitting ? 'Creating...' : 'Add Pack'}
+            Pair Device
           </button>
-        </form>
+          <button
+            onClick={() => { setActiveTab('manual'); setError(''); setSuccess(''); }}
+            className={`flex-1 py-3 text-sm font-medium text-center transition ${
+              activeTab === 'manual' ? 'text-blue-600 border-b-2 border-blue-600' : 'text-gray-500 hover:text-gray-700'
+            }`}
+          >
+            Manual Setup
+          </button>
+        </div>
+
+        <div className="p-6">
+          {error && (
+            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-md text-sm text-red-600">{error}</div>
+          )}
+          {success && (
+            <div className="mb-4 p-3 bg-emerald-50 border border-emerald-200 rounded-md text-sm text-emerald-600">{success}</div>
+          )}
+
+          {activeTab === 'pair' ? (
+            <form onSubmit={handlePair} className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Pairing Code</label>
+                <input
+                  type="text"
+                  value={pairingCode}
+                  onChange={(e) => setPairingCode(e.target.value.toUpperCase().replace(/[^A-F0-9]/g, '').slice(0, 6))}
+                  placeholder="e.g. 27AF28"
+                  maxLength={6}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-lg tracking-widest text-center uppercase"
+                />
+                <p className="mt-2 text-xs text-gray-500">
+                  Find the 6-character code on your device label or in the serial monitor output.
+                </p>
+              </div>
+              <button
+                type="submit"
+                disabled={submitting || pairingCode.length < 6}
+                className={`w-full py-3 px-4 rounded-md text-sm font-medium text-white transition ${
+                  submitting || pairingCode.length < 6 ? 'bg-blue-300 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'
+                }`}
+              >
+                {submitting ? 'Pairing...' : 'Pair Device'}
+              </button>
+            </form>
+          ) : (
+            <form onSubmit={handleManualSubmit} className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Pack Name</label>
+                <input
+                  type="text"
+                  value={form.name}
+                  onChange={(e) => setForm(f => ({ ...f, name: e.target.value }))}
+                  placeholder="e.g. Pack Alpha"
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Pack Identifier</label>
+                <input
+                  type="text"
+                  value={form.pack_identifier}
+                  onChange={(e) => setForm(f => ({ ...f, pack_identifier: e.target.value }))}
+                  placeholder="e.g. wbms-27af28"
+                  className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Series Count</label>
+                  <input
+                    type="number"
+                    min="1"
+                    value={form.series_count}
+                    onChange={(e) => setForm(f => ({ ...f, series_count: e.target.value }))}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Parallel Count</label>
+                  <input
+                    type="number"
+                    min="1"
+                    value={form.parallel_count}
+                    onChange={(e) => setForm(f => ({ ...f, parallel_count: e.target.value }))}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+              </div>
+              <div className="p-3 bg-gray-50 rounded-lg text-sm text-gray-600">
+                Configuration: <span className="font-semibold">{form.series_count}S{form.parallel_count}P</span> ({(parseInt(form.series_count) || 0) * (parseInt(form.parallel_count) || 0)} cells)
+              </div>
+              <button
+                type="submit"
+                disabled={submitting}
+                className={`w-full py-3 px-4 rounded-md text-sm font-medium text-white transition ${
+                  submitting ? 'bg-blue-300 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'
+                }`}
+              >
+                {submitting ? 'Creating...' : 'Add Pack'}
+              </button>
+            </form>
+          )}
+        </div>
       </div>
     </div>
   );
