@@ -13,6 +13,7 @@ from app.models.database import engine, Base
 from app.mqtt_subscriber import start_mqtt, stop_mqtt
 from app.routes.auth import router as auth_router
 from app.routes.packs import router as packs_router
+from app.routes.groups import router as groups_router
 
 # Import models so Base knows about them
 from app.models import models  # noqa: F401
@@ -58,6 +59,7 @@ app.add_middleware(
 # Include routers
 app.include_router(auth_router)
 app.include_router(packs_router)
+app.include_router(groups_router)
 
 
 @app.get("/")

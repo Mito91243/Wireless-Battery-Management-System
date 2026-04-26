@@ -1,6 +1,6 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Literal, List
 
 
 class Token(BaseModel):
@@ -73,3 +73,28 @@ class BatteryReadingCreate(BaseModel):
     battery_position: int
     pack_id: int
     voltage: float
+
+
+class GroupCreate(BaseModel):
+    name: str
+    connection_type: Literal["parallel", "series"] = "parallel"
+    pack_ids: List[int] = Field(default_factory=list)
+
+
+class GroupUpdate(BaseModel):
+    name: Optional[str] = None
+    connection_type: Optional[Literal["parallel", "series"]] = None
+
+
+class GroupAddPack(BaseModel):
+    pack_id: int
+
+
+class GroupResponse(BaseModel):
+    id: int
+    name: str
+    connection_type: str
+    pack_ids: List[int]
+
+    class Config:
+        from_attributes = True

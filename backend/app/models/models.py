@@ -1,8 +1,18 @@
 # models.py
-from sqlalchemy import Boolean, Column, Integer, String, Float, DateTime, ForeignKey, Index
+from sqlalchemy import Boolean, Column, Integer, String, Float, DateTime, ForeignKey, Index, Table
 from sqlalchemy.orm import relationship
 from app.models.database import Base
 from datetime import datetime, timezone
+
+
+# Association table for many-to-many between Pack and PackGroup
+pack_group_members = Table(
+    "pack_group_members",
+    Base.metadata,
+    Column("pack_id", Integer, ForeignKey("packs.id", ondelete="CASCADE"), primary_key=True),
+    Column("group_id", Integer, ForeignKey("pack_groups.id", ondelete="CASCADE"), primary_key=True),
+)
+
 
 class User(Base):
     __tablename__ = "users"
@@ -15,6 +25,7 @@ class User(Base):
     google_sub = Column(String(255), unique=True, nullable=True, index=True)
 
     packs = relationship("Pack", back_populates="owner")
+    groups = relationship("PackGroup", back_populates="owner", cascade="all, delete-orphan")
 
 
 class Pack(Base):
@@ -35,20 +46,39 @@ class Pack(Base):
     auto_created = Column(Boolean, default=False, nullable=False)
 
     owner = relationship("User", back_populates="packs")
-    
-    # Relationships - One Pack has many Readings and BatteryReadings
+    groups = relationship("PackGroup", secondary=pack_group_members, back_populates="packs")
+
+    # One Pack has many Readings and BatteryReadings
     readings = relationship(
-        "Reading", 
-        back_populates="pack", 
+        "Reading",
+        back_populates="pack",
         cascade="all, delete-orphan",
-        lazy="dynamic"  # Query on-demand instead of loading all at once
+        lazy="dynamic",
     )
     battery_readings = relationship(
-        "BatteryReading", 
-        back_populates="pack", 
+        "BatteryReading",
+        back_populates="pack",
         cascade="all, delete-orphan",
-        lazy="dynamic"
+        lazy="dynamic",
     )
+
+
+class PackGroup(Base):
+    __tablename__ = "pack_groups"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False)
+    connection_type = Column(String(20), nullable=False, default="parallel")  # "parallel" | "series"
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    owner = relationship("User", back_populates="groups")
+    packs = relationship("Pack", secondary=pack_group_members, back_populates="groups")
 
 class Reading(Base):
     __tablename__ = "readings"
