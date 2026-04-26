@@ -15,6 +15,10 @@ class UserCreate(BaseModel):
     password: str
 
 
+class GoogleAuthRequest(BaseModel):
+    credential: str
+
+
 class UserResponse(BaseModel):
     id: int
     first_name: str

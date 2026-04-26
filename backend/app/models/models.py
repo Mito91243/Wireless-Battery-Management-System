@@ -11,7 +11,8 @@ class User(Base):
     first_name = Column(String(100), nullable=False)
     last_name = Column(String(100), nullable=False)
     email = Column(String(255), unique=True, nullable=False, index=True)
-    password = Column(String(255), nullable=False)
+    password = Column(String(255), nullable=True)
+    google_sub = Column(String(255), unique=True, nullable=True, index=True)
 
     packs = relationship("Pack", back_populates="owner")
 

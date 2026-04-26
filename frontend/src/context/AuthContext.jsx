@@ -42,6 +42,16 @@ export function AuthProvider({ children }) {
     await login(email, password);
   }
 
+  async function loginWithGoogle(credential) {
+    const data = await apiFetch("/v1/auth/google", {
+      method: "POST",
+      body: JSON.stringify({ credential }),
+    });
+    localStorage.setItem("wbms_token", data.access_token);
+    const me = await apiFetch("/v1/auth/me");
+    setUser(me);
+  }
+
   function logout() {
     localStorage.removeItem("wbms_token");
     setUser(null);
@@ -49,7 +59,15 @@ export function AuthProvider({ children }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, loading, isAuthenticated: !!user, login, register, logout }}
+      value={{
+        user,
+        loading,
+        isAuthenticated: !!user,
+        login,
+        register,
+        loginWithGoogle,
+        logout,
+      }}
     >
       {children}
     </AuthContext.Provider>

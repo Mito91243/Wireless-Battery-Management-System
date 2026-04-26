@@ -10,6 +10,9 @@ Thumbs.db
 .env
 *.env
 
+# Google OAuth client secrets
+client_secret_*.json
+
 # Dependency directories
 node_modules/
 venv/

@@ -2,8 +2,12 @@ import logging
 import os
 from datetime import datetime
 
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+# Load backend/.env before anything else reads os.getenv(...)
+load_dotenv()
 
 from app.models.database import engine, Base
 from app.mqtt_subscriber import start_mqtt, stop_mqtt
