@@ -13,6 +13,9 @@ Thumbs.db
 # Google OAuth client secrets
 client_secret_*.json
 
+# Mosquitto password file (secret)
+mosquitto/config/passwd
+
 # Dependency directories
 node_modules/
 venv/

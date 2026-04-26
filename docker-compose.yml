@@ -1,4 +1,14 @@
 services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+
   backend:
     build: ./backend
     restart: unless-stopped
@@ -7,7 +17,7 @@ services:
     environment:
       - WBMS_DATABASE_URL=sqlite:////app/data/wbms.db
       - WBMS_SECRET_KEY=ab608e384edf5a9032436c28d5989957c7f232e04066a9b8146212821ee97ac9
-      - MQTT_BROKER=64.23.174.210
+      - MQTT_BROKER=mosquitto
       - MQTT_PORT=1883
       - MQTT_TOPIC=bms/data
       - MQTT_USERNAME=wbms-backend
@@ -16,6 +26,8 @@ services:
       - CONNECTED_CELLS=3
       - PARALLEL_COUNT=1
       - GOOGLE_CLIENT_ID=1017515470953-bpdre0hbqc5r7ejsf4rr466ndbgv5isg.apps.googleusercontent.com
+    depends_on:
+      - mosquitto
     # No ports exposed — only reachable via the frontend Nginx proxy
     # To access API docs directly, uncomment:
     # ports:
@@ -31,3 +43,5 @@ services:
 
 volumes:
   db-data:
+  mosquitto-data:
+  mosquitto-log:
