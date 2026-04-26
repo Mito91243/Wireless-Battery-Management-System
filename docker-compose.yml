@@ -15,6 +15,7 @@ services:
       - FRONTEND_ORIGIN=https://wbms.systems
       - CONNECTED_CELLS=3
       - PARALLEL_COUNT=1
+      - GOOGLE_CLIENT_ID=1017515470953-bpdre0hbqc5r7ejsf4rr466ndbgv5isg.apps.googleusercontent.com
     # No ports exposed — only reachable via the frontend Nginx proxy
     # To access API docs directly, uncomment:
     # ports:
