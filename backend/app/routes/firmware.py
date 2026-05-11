@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import os
+import re
 import time
 from pathlib import Path
 
@@ -33,6 +35,15 @@ from app.mqtt_subscriber import (
     OTA_URL_SECRET,
     publish_command,
 )
+
+# Override for `request.base_url` when the backend sits behind a reverse
+# proxy that doesn't forward X-Forwarded-Proto/Host (our nginx doesn't).
+# Set this to the externally-reachable URL the master should fetch from,
+# e.g. https://wbms.systems
+BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "").rstrip("/")
+
+# Version string sanity-check — also makes it safe to put in a filename.
+_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 
 router = APIRouter(prefix="/v1/firmware", tags=["firmware"])
 
@@ -68,7 +79,9 @@ def _verify_blob_token(image_id: int, token: str) -> None:
 def _mint_blob_url(request: Request, image_id: int) -> str:
     exp = int(time.time()) + OTA_BLOB_TTL_SECONDS
     token = f"{exp}.{_sign_blob_token(image_id, exp)}"
-    base = str(request.base_url).rstrip("/")
+    # Behind a TLS-terminating proxy `request.base_url` is wrong (it'd point
+    # at the internal http://backend:8000). Honor BACKEND_PUBLIC_URL when set.
+    base = BACKEND_PUBLIC_URL or str(request.base_url).rstrip("/")
     return f"{base}/v1/firmware/{image_id}/blob?token={token}"
 
 
@@ -80,8 +93,11 @@ async def upload_firmware(
     db: Session = Depends(get_db),
 ):
     version = version.strip()
-    if not version:
-        raise HTTPException(status_code=400, detail="Version is required")
+    if not _VERSION_RE.match(version):
+        raise HTTPException(
+            status_code=400,
+            detail="Version must match [A-Za-z0-9._-]{1,32} (e.g. 0.1.1)",
+        )
 
     existing = db.query(FirmwareImage).filter(FirmwareImage.version == version).first()
     if existing:
@@ -168,6 +184,11 @@ def dispatch_ota(
     pack = db.query(Pack).filter(Pack.id == pack_id).first()
     if not pack:
         raise HTTPException(status_code=404, detail="Pack not found")
+
+    # Owner-only, with auto-created (unclaimed) packs treated as open so the
+    # first-time setup flow doesn't require a claim-then-OTA dance.
+    if pack.user_id is not None and pack.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Pack belongs to another user")
 
     if not pack.master_pairing_code:
         raise HTTPException(

@@ -14,6 +14,7 @@ services:
     restart: unless-stopped
     volumes:
       - db-data:/app/data
+      - firmware-artifacts:/app/firmware_artifacts
     environment:
       - WBMS_DATABASE_URL=sqlite:////app/data/wbms.db
       - WBMS_SECRET_KEY=ab608e384edf5a9032436c28d5989957c7f232e04066a9b8146212821ee97ac9
@@ -26,6 +27,11 @@ services:
       - CONNECTED_CELLS=3
       - PARALLEL_COUNT=1
       - GOOGLE_CLIENT_ID=1017515470953-bpdre0hbqc5r7ejsf4rr466ndbgv5isg.apps.googleusercontent.com
+      # OTA — the public URL the master will fetch firmware blobs from.
+      # OTA_URL_SECRET signs short-lived blob tokens; rotate occasionally.
+      - BACKEND_PUBLIC_URL=https://wbms.systems
+      - OTA_URL_SECRET=${OTA_URL_SECRET:-change-me-in-production-please}
+      - FIRMWARE_DIR=/app/firmware_artifacts
     depends_on:
       - mosquitto
     # No ports exposed — only reachable via the frontend Nginx proxy
@@ -43,5 +49,6 @@ services:
 
 volumes:
   db-data:
+  firmware-artifacts:
   mosquitto-data:
   mosquitto-log:
