@@ -532,8 +532,13 @@ float BQ76952::getAccumulatedCharge(void)
   // Convert the fractional portion to userAh by dividing by 2^32
   float fractionalCharge = (float)accumChargeFraction / (float)(1ULL << 32);
 
+  // Per BQ76952 TRM Section 4.6 (Table 4-6):
+  // The fractional portion is initialized to exactly 0.5 userAh when reset!
+  // We must subtract 0.5 to keep the math centered at 0.0 upon reset.
+  fractionalCharge -= 0.5f;
+
   // Combine the integer and fractional portions
-  float totalAccumulatedCharge = accumChargeInteger + fractionalCharge;
+  float totalAccumulatedCharge = (float)accumChargeInteger + fractionalCharge;
 
   return totalAccumulatedCharge;
 }

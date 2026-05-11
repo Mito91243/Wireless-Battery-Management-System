@@ -117,8 +117,40 @@ float BatteryEKF::interpolateLUT(const float* lut, float soc) {
     return val_low + frac * (val_high - val_low);
 }
 
+// 2D Interpolation (SOC and Temperature)
+float BatteryEKF::interpolateLUT2D(const float lut[][4], float soc, float temp_C) {
+    // 1. Clamp inputs
+    float s = constrain(soc, 0.0f, 100.0f);
+    float t = constrain(temp_C, 10.0f, 60.0f);
+    
+    // 2. SOC Indices (101 points: 0 to 100)
+    int s_idx0 = (int)s;
+    int s_idx1 = min(s_idx0 + 1, 100);
+    float s_frac = s - (float)s_idx0;
+    
+    // 3. Temp Indices (4 points: 10, 25, 45, 60)
+    const float t_axis[4] = {10.0f, 25.0f, 45.0f, 60.0f};
+    int t_idx0 = 0, t_idx1 = 1;
+    if (t >= 45.0f) { t_idx0 = 2; t_idx1 = 3; }
+    else if (t >= 25.0f) { t_idx0 = 1; t_idx1 = 2; }
+    
+    float t_frac = (t - t_axis[t_idx0]) / (t_axis[t_idx1] - t_axis[t_idx0]);
+    
+    // 4. Read 4 points from PROGMEM
+    float v00 = pgm_read_float(&lut[s_idx0][t_idx0]);
+    float v10 = pgm_read_float(&lut[s_idx1][t_idx0]);
+    float v01 = pgm_read_float(&lut[s_idx0][t_idx1]);
+    float v11 = pgm_read_float(&lut[s_idx1][t_idx1]);
+    
+    // 5. Bilinear Interpolation
+    float v0 = v00 + s_frac * (v10 - v00);
+    float v1 = v01 + s_frac * (v11 - v01);
+    
+    return v0 + t_frac * (v1 - v0);
+}
+
 // State transition function
-void BatteryEKF::stateTransition(const float x_in[4], float current_A, 
+void BatteryEKF::stateTransition(const float x_in[4], float current_A, float temp_C,
                                  float x_out[4], float F[16]) {
     // Extract states
     float SOC = x_in[0];
@@ -129,11 +161,11 @@ void BatteryEKF::stateTransition(const float x_in[4], float current_A,
     float SOC_clamped = constrain(SOC, 0.0f, 100.0f);
     
     // Get RC parameters from LUTs
-    float R1 = interpolateLUT(LUT_RC1_R, SOC_clamped);
+    float R1 = interpolateLUT2D(LUT_RC1_R_2D, SOC_clamped, temp_C);
     float C1 = interpolateLUT(LUT_RC1_C, SOC_clamped);
-    float R2 = interpolateLUT(LUT_RC2_R, SOC_clamped);
+    float R2 = interpolateLUT2D(LUT_RC2_R_2D, SOC_clamped, temp_C);
     float C2 = interpolateLUT(LUT_RC2_C, SOC_clamped);
-    float R3 = interpolateLUT(LUT_RC3_R, SOC_clamped);
+    float R3 = interpolateLUT2D(LUT_RC3_R_2D, SOC_clamped, temp_C);
     float C3 = interpolateLUT(LUT_RC3_C, SOC_clamped);
     
     // Compute time constants (with minimum bound)
@@ -162,7 +194,7 @@ void BatteryEKF::stateTransition(const float x_in[4], float current_A,
 }
 
 // Measurement function  
-float BatteryEKF::measurementFunction(const float x_in[4], float current_A, float H[4]) {
+float BatteryEKF::measurementFunction(const float x_in[4], float current_A, float temp_C, float H[4]) {
     // Extract states
     float SOC = x_in[0];
     float V_RC1 = x_in[1];
@@ -187,12 +219,12 @@ float BatteryEKF::measurementFunction(const float x_in[4], float current_A, floa
     }
     
     // R0 lookup
-    float R0 = interpolateLUT(LUT_R0_eff, SOC_clamped); // PERFECT BARE CELL R0
+    float R0 = interpolateLUT2D(LUT_R0_2D, SOC_clamped, temp_C); // PERFECT BARE CELL R0
     
     // Neural Network correction (if enabled and current > threshold)
     float V_NN = 0.0f;
     if (nn_enabled && fabsf(current_A) > 0.01f) {
-        V_NN = neuralNetworkCorrection(SOC_clamped, current_A, V_RC2, V_RC3, OCV);
+        V_NN = neuralNetworkCorrection(SOC_clamped, current_A, V_RC2, V_RC3, OCV, temp_C);
     }
     
     // Predicted terminal voltage
@@ -221,8 +253,8 @@ float BatteryEKF::measurementFunction(const float x_in[4], float current_A, floa
         OCV_lo = (OCV_chg_lo + OCV_dsg_lo) * 0.5f;
     }
     
-    float R0_hi = interpolateLUT(LUT_R0_eff, SOC_hi);
-    float R0_lo = interpolateLUT(LUT_R0_eff, SOC_lo);
+    float R0_hi = interpolateLUT2D(LUT_R0_2D, SOC_hi, temp_C);
+    float R0_lo = interpolateLUT2D(LUT_R0_2D, SOC_lo, temp_C);
     
     float dV_dSOC = (OCV_hi - OCV_lo) / (SOC_hi - SOC_lo) + 
                     (R0_hi - R0_lo) / (SOC_hi - SOC_lo) * current_A;
@@ -237,8 +269,8 @@ float BatteryEKF::measurementFunction(const float x_in[4], float current_A, floa
 
 // Neural Network forward pass
 float BatteryEKF::neuralNetworkCorrection(float soc, float current, 
-                                          float V_RC2, float V_RC3, float ocv) {
-    // Input features: [SOC, Current, V_RC2, V_RC3, Current_Sign, OCV]
+                                          float V_RC2, float V_RC3, float ocv, float temp_C) {
+    // Input features: [SOC, Current, V_RC2, V_RC3, Current_Sign, OCV, T_ambient]
     float x_nn[NN_INPUT_SIZE];
     x_nn[0] = soc;
     x_nn[1] = current;
@@ -246,6 +278,7 @@ float BatteryEKF::neuralNetworkCorrection(float soc, float current,
     x_nn[3] = V_RC3;
     x_nn[4] = (current >= 0.0f) ? 1.0f : -1.0f;  // Current sign
     x_nn[5] = ocv;
+    x_nn[6] = temp_C;
     
     // Normalize inputs
     for (int i = 0; i < NN_INPUT_SIZE; i++) {
@@ -319,43 +352,25 @@ void BatteryEKF::adaptQR(float current_A, float voltage_err, float soc_uncertain
 
     float abs_v_err = fabsf(voltage_err);
     
-    // FATAL FLAW FIX: The EKF was punishing SOC during high current because of unmodeled IR drop!
-    // We MUST ONLY trust the voltage heavily when AT REST.
     if (is_at_rest) {
-        // At rest, voltage is close to true OCV. If we have high error, slowly drag SOC.
-        if (abs_v_err > 0.050f && SOC_current > 10.0f) {  
-            Q[0] = 5.0f;    
-            R = 0.0001f;    
-        }
-        else if (abs_v_err > 0.020f && SOC_current > 10.0f) {
-            Q[0] = 1.0f;
-            R = 0.001f;
-        }
-        else if (abs_v_err > 0.005f && SOC_current > 10.0f) {
-            Q[0] = 0.1f * Ts;
-            R = 0.01f;
-        }
-        else {
-            Q[0] = 1e-8f; // Minimal SOC drift at rest
-            R = 0.0001f;  // Lock onto good voltage
-        }
+        // When at rest, the voltage is relaxing. DO NOT aggressively drag SOC.
+        // Let the RC states decay naturally while SOC stays flat.
+        Q[0] = 1e-6f;  // Minimal SOC drift
+        R = 0.05f;     // High measurement noise (don't trust relaxing voltage too much)
     } 
     else {
-        // ACTIVE LOAD: The user's Neural Network is specifically designed for this phase!
-        // We restore Q and R so the filter actively relies on and trusts the ECM+NN model!
-        Q[0] = 5.0f;     // High process noise (actively tracking NN model)
-        R = 0.001f;      // Very low measurement noise (heavily trust the voltage/NN relationship)
-        
-        // We let the microscopic mathematical 'Kalman Gain Clamp' protect from the 80% wiring spikes! 
+        // ACTIVE LOAD: Rely more heavily on the Neural Network & Coulomb Counting
+        Q[0] = 1e-5f;    // Small process noise
+        R = 0.01f;       // Trust the voltage/NN relationship more
     }
     
-    // Apply to all RC diagonal elements
-    Q[1] = 0.01f;
-    Q[2] = 0.01f;
-    Q[3] = 0.01f;
+    // Process noise for RC states (allow them to move to fit the voltage curve)
+    Q[1] = 1e-3f;
+    Q[2] = 1e-3f;
+    Q[3] = 1e-3f;
 }
 // Main EKF update function
-void BatteryEKF::update(float current_A, float voltage_V) {
+void BatteryEKF::update(float current_A, float voltage_V, float temp_C) {
     // ========================================================================
     // PRE-PROCESSING: REMOVE PARASITIC RESISTANCE
     // ========================================================================
@@ -377,7 +392,7 @@ void BatteryEKF::update(float current_A, float voltage_V) {
     float x_pred[4];
     float F[16];  // Jacobian df/dx
 
-    stateTransition(x, current_A, x_pred, F);
+    stateTransition(x, current_A, temp_C, x_pred, F);
     
     // Predict covariance: P_pred = F * P * F' + Q
     float P_pred[16];
@@ -404,13 +419,13 @@ void BatteryEKF::update(float current_A, float voltage_V) {
     // ========================================================================
     
     float H[4];  // Jacobian dh/dx (1x4)
-    V_predicted = measurementFunction(x_pred, current_A, H);
+    V_predicted = measurementFunction(x_pred, current_A, temp_C, H);
     voltage_error = fabsf(voltage_V - V_predicted);
     
     // EKF Trust Guard: If voltage error is HUGE (pulse load), increase R to reduce trust in model
     float final_R = R;
     if (voltage_error > trust_guard_threshold) {
-        final_R *= 10.0f; // Increase measurement noise factor
+        final_R *= 1000.0f; // Massively increase measurement noise to reject phantom ADC/CC aliasing glitches
     }
 
     // Innovation covariance: S = H * P_pred * H' + final_R

@@ -47,9 +47,11 @@ public:
     void begin(float initial_soc_pct = 100.0f);
     
     // Main EKF update function
+    // Main EKF update function
     // current_A: positive = charge, negative = discharge
     // voltage_V: measured terminal voltage
-    void update(float current_A, float voltage_V);
+    // temp_C: ambient/cell temperature (default 25.0)
+    void update(float current_A, float voltage_V, float temp_C = 25.0f);
     
     // Get current SOC estimate
     float getSOC() const { return x[0]; }
@@ -120,10 +122,11 @@ private:
     float trust_guard_threshold;
     
     // Internal functions
-    void stateTransition(const float x_in[4], float current_A, float x_out[4], float F[16]);
-    float measurementFunction(const float x_in[4], float current_A, float H[4]);
-    float neuralNetworkCorrection(float soc, float current, float V_RC2, float V_RC3, float ocv);
+    void stateTransition(const float x_in[4], float current_A, float temp_C, float x_out[4], float F[16]);
+    float measurementFunction(const float x_in[4], float current_A, float temp_C, float H[4]);
+    float neuralNetworkCorrection(float soc, float current, float V_RC2, float V_RC3, float ocv, float temp_C);
     float interpolateLUT(const float* lut, float soc);
+    float interpolateLUT2D(const float lut[][4], float soc, float temp_C);
     void adaptQR(float current_A, float voltage_err, float soc_uncertainty);
     
     // Matrix operations (4x4 matrices)
