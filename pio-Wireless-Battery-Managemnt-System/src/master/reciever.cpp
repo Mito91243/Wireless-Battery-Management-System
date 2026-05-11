@@ -3,6 +3,10 @@
 #include <WiFiManager.h>
 #include <PubSubClient.h>
 #include <esp_wifi.h>
+#include <esp_https_ota.h>
+#include <esp_ota_ops.h>
+#include <esp_crt_bundle.h>
+#include <string.h>
 #include "config.h"
 #include "BatteryEKF.h"
 
@@ -64,6 +68,29 @@ uint8_t currentChannel = 0;
 // ==================== MQTT CLIENT ====================
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
+
+// ==================== OTA STATE ====================
+// Master's pairing code = last 3 bytes of its STA MAC, formatted as hex
+// (mirrors the slave's derivation in sender.cpp). Used as the suffix of the
+// MQTT command topic the master subscribes to.
+char masterPairingCode[7] = "000000";
+char mqttCmdTopic[40] = "";
+
+// Per-sender health snapshot used to decide if it's safe to OTA. Updated
+// each time a message is dequeued. `lastSoc < 0` means we haven't observed
+// this sender yet — treated as "not safe to OTA".
+typedef struct
+{
+  float lastSoc;
+  bool faultActive;
+  bool hasData;
+} SenderState;
+SenderState senderState[NUM_SENDERS];
+
+// One-shot: after a successful OTA, the new firmware boots into a "pending
+// verify" state. We mark it valid once both WiFi and MQTT are confirmed up,
+// proving the new image at least gets us back online.
+bool otaMarkValidPending = true;
 
 // ==================== HELPERS ====================
 String macToString(const uint8_t *mac)
@@ -162,6 +189,147 @@ void maintainWiFi()
   }
 }
 
+// ==================== OTA HELPERS ====================
+// Cheap manual JSON string-field extractor: looks for `"key":"<value>"` in
+// `json` and copies the value into `out`. Returns false if the key is
+// missing or the value won't fit. Good enough for the small, master-only
+// command payloads — we don't want to pull ArduinoJson in for this.
+bool extractJsonString(const char *json, const char *key, char *out, size_t outSize)
+{
+  if (!json || !key || !out || outSize == 0) return false;
+
+  char needle[32];
+  int needleLen = snprintf(needle, sizeof(needle), "\"%s\"", key);
+  if (needleLen <= 0 || needleLen >= (int)sizeof(needle)) return false;
+
+  const char *p = strstr(json, needle);
+  if (!p) return false;
+  p += needleLen;
+
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p != ':') return false;
+  p++;
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p != '"') return false;
+  p++;
+
+  size_t i = 0;
+  while (*p && *p != '"' && i + 1 < outSize)
+  {
+    out[i++] = *p++;
+  }
+  if (*p != '"') return false;
+  out[i] = '\0';
+  return true;
+}
+
+// Walk every sender's snapshot and decide whether OTA is safe right now.
+// Outputs a human-readable reason on refusal for the serial log.
+bool senderFleetSafeForOta(char *reason, size_t reasonSize)
+{
+  for (int i = 0; i < NUM_SENDERS; i++)
+  {
+    if (!senderState[i].hasData)
+    {
+      snprintf(reason, reasonSize, "Sender %d has no telemetry yet", i + 1);
+      return false;
+    }
+    if (senderState[i].lastSoc < MIN_SOC_FOR_OTA)
+    {
+      snprintf(reason, reasonSize, "Sender %d SoC=%.1f%% < %.1f%%",
+               i + 1, senderState[i].lastSoc, MIN_SOC_FOR_OTA);
+      return false;
+    }
+    if (senderState[i].faultActive)
+    {
+      snprintf(reason, reasonSize, "Sender %d has active protection fault", i + 1);
+      return false;
+    }
+  }
+  return true;
+}
+
+void performOta(const char *url, const char *version, const char *sha256)
+{
+  Serial.printf("[OTA] Starting upgrade to v%s\n", version);
+  Serial.printf("[OTA]   URL:    %s\n", url);
+  Serial.printf("[OTA]   SHA256: %s\n", (sha256 && *sha256) ? sha256 : "(none provided)");
+
+  esp_http_client_config_t httpConfig = {};
+  httpConfig.url = url;
+  httpConfig.timeout_ms = 30000;
+  httpConfig.keep_alive_enable = true;
+  httpConfig.crt_bundle_attach = arduino_esp_crt_bundle_attach;
+
+  esp_err_t err = esp_https_ota(&httpConfig);
+  if (err == ESP_OK)
+  {
+    Serial.println("[OTA] ✅ Image installed, rebooting...");
+    delay(500);
+    esp_restart();
+  }
+  else
+  {
+    Serial.printf("[OTA] ❌ Upgrade failed: %s (0x%x)\n", esp_err_to_name(err), err);
+  }
+}
+
+void handleOtaCommand(const char *json)
+{
+  char op[16] = {0};
+  if (!extractJsonString(json, "op", op, sizeof(op)) || strcmp(op, "ota") != 0)
+  {
+    Serial.printf("[OTA] Ignoring command, op=%s\n", op);
+    return;
+  }
+
+  char url[256] = {0};
+  char version[24] = {0};
+  char sha256[80] = {0};
+  if (!extractJsonString(json, "url", url, sizeof(url)) ||
+      !extractJsonString(json, "version", version, sizeof(version)))
+  {
+    Serial.println("[OTA] ❌ Command missing url or version");
+    return;
+  }
+  extractJsonString(json, "sha256", sha256, sizeof(sha256)); // optional
+
+  if (strcmp(version, FW_VERSION) == 0)
+  {
+    Serial.printf("[OTA] Refused: already on v%s\n", FW_VERSION);
+    return;
+  }
+
+  char reason[80];
+  if (!senderFleetSafeForOta(reason, sizeof(reason)))
+  {
+    Serial.printf("[OTA] Refused: %s\n", reason);
+    return;
+  }
+
+  performOta(url, version, sha256);
+}
+
+void mqttCallback(char *topic, byte *payload, unsigned int length)
+{
+  // Copy payload to a local null-terminated buffer so strstr/strcmp work.
+  char buf[512];
+  if (length >= sizeof(buf))
+  {
+    Serial.printf("[MQTT] Command on %s too large (%u bytes), dropping\n", topic, length);
+    return;
+  }
+  memcpy(buf, payload, length);
+  buf[length] = '\0';
+
+  Serial.printf("[MQTT] 📨 Command on %s: %s\n", topic, buf);
+
+  if (strcmp(topic, mqttCmdTopic) == 0)
+  {
+    handleOtaCommand(buf);
+  }
+}
+
 // ==================== MQTT FUNCTIONS ====================
 void connectMqtt()
 {
@@ -178,6 +346,14 @@ void connectMqtt()
   if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD))
   {
     Serial.println("[MQTT] ✅ Connected!");
+    if (mqtt.subscribe(mqttCmdTopic))
+    {
+      Serial.printf("[MQTT] 🔔 Subscribed to %s\n", mqttCmdTopic);
+    }
+    else
+    {
+      Serial.printf("[MQTT] ✗ Subscribe to %s failed\n", mqttCmdTopic);
+    }
   }
   else
   {
@@ -199,6 +375,8 @@ String buildJsonPayload(int senderIndex, const DeviceMessage &data, float soc)
   json += "\"senderIndex\":" + String(senderIndex + 1) + ",";
   json += "\"connectedCells\":" + String(CONNECTED_CELLS) + ",";
   json += "\"pairingCode\":\"" + pairingCode + "\",";
+  json += "\"masterPairingCode\":\"" + String(masterPairingCode) + "\",";
+  json += "\"fwVersion\":\"" + String(FW_VERSION) + "\",";
 
   for (int i = 0; i < 16; i++)
   {
@@ -301,6 +479,25 @@ void setup()
   Serial.begin(115200);
   delay(1000);
 
+  // Per-sender state: -1 SoC = unknown, no fault, no data yet.
+  for (int i = 0; i < NUM_SENDERS; i++)
+  {
+    senderState[i].lastSoc = -1.0f;
+    senderState[i].faultActive = false;
+    senderState[i].hasData = false;
+  }
+
+  // Derive master pairing code from STA MAC last 3 bytes — matches the
+  // slave's scheme so the backend can pair masters and slaves by code.
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  snprintf(masterPairingCode, sizeof(masterPairingCode), "%02X%02X%02X",
+           mac[3], mac[4], mac[5]);
+  snprintf(mqttCmdTopic, sizeof(mqttCmdTopic), "%s%s",
+           MQTT_CMD_TOPIC_PREFIX, masterPairingCode);
+  Serial.printf("[System] FW v%s, masterPairingCode=%s\n", FW_VERSION, masterPairingCode);
+  Serial.printf("[System] MQTT command topic: %s\n", mqttCmdTopic);
+
   if (!initWiFi())
   {
     Serial.println("[System] Running in ESP-NOW only mode");
@@ -309,6 +506,7 @@ void setup()
   // ── MQTT setup ──
   mqtt.setServer(MQTT_BROKER, MQTT_PORT);
   mqtt.setBufferSize(512);
+  mqtt.setCallback(mqttCallback);
   connectMqtt();
 
   // ── ESP-NOW setup ──
@@ -332,11 +530,42 @@ void setup()
   Serial.println("[System] ✅ Master ready (MQTT + ESP-NOW)");
 }
 
+// Derive a "fault active" flag from the data we already have on the wire.
+// The slave's BQ76952 getProtectionStatus() isn't included in DeviceMessage
+// (V1 keeps the wire contract frozen), so this is a conservative proxy: any
+// cell outside [2.5, 4.25] V or any temperature above 60 C blocks OTA.
+bool deriveFaultFromMessage(const DeviceMessage &data)
+{
+  for (int i = 0; i < 16; i++)
+  {
+    unsigned int mv = data.v[i];
+    if (mv == 0) continue; // disconnected channel
+    if (mv < 2500 || mv > 4250) return true;
+  }
+  if (data.temp1 > 60.0f || data.temp2 > 60.0f || data.temp3 > 60.0f) return true;
+  if (data.chip_temp > 75.0f) return true;
+  return false;
+}
+
 void loop()
 {
   maintainWiFi();
   connectMqtt();
   mqtt.loop();
+
+  // One-shot: cancel pending rollback once the new image proves it can get
+  // both WiFi and MQTT up. Skipped silently on the first boot of a flashed
+  // (non-OTA) image because esp_ota_mark_app_valid_cancel_rollback() is a
+  // no-op outside the PENDING_VERIFY state.
+  if (otaMarkValidPending && WiFi.status() == WL_CONNECTED && mqtt.connected())
+  {
+    esp_err_t markErr = esp_ota_mark_app_valid_cancel_rollback();
+    if (markErr == ESP_OK)
+    {
+      Serial.println("[OTA] ✅ Marked running image valid, rollback cancelled");
+    }
+    otaMarkValidPending = false;
+  }
 
   QueuedMessage qMsg;
   if (dequeueMessage(qMsg))
@@ -364,6 +593,10 @@ void loop()
       float soc = ekf[idx].getSOC();
       Serial.printf("[EKF] Sender %d: SoC=%.1f%% (V_err=%.1fmV)\n",
                     idx + 1, soc, ekf[idx].getVoltageError() * 1000.0f);
+
+      senderState[idx].lastSoc = soc;
+      senderState[idx].faultActive = deriveFaultFromMessage(qMsg.data);
+      senderState[idx].hasData = true;
 
       publishToMqtt(idx, qMsg.data, soc);
     }

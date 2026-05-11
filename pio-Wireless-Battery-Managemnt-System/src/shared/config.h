@@ -22,6 +22,11 @@ const char *const MQTT_CLIENT_ID = "wbms-master";
 const char *const MQTT_USERNAME = "wbms-master";
 const char *const MQTT_PASSWORD = "mito1234";
 const uint32_t MQTT_RECONNECT_INTERVAL_MS = 5000;
+const char *const MQTT_CMD_TOPIC_PREFIX = "bms/cmd/";
+
+// ==================== OTA CONFIG ====================
+const char *const FW_VERSION = "0.1.0";
+const float MIN_SOC_FOR_OTA = 30.0f;
 
 // ==================== HARDWARE CONFIG ====================
 const int I2C_SDA_PIN = 21; // Standard I2C SDA on ESP32 DevKit V1
