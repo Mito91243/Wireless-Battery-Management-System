@@ -25,8 +25,13 @@ const uint32_t MQTT_RECONNECT_INTERVAL_MS = 5000;
 const char *const MQTT_CMD_TOPIC_PREFIX = "bms/cmd/";
 
 // ==================== OTA CONFIG ====================
-const char *const FW_VERSION = "0.1.1";
+const char *const FW_VERSION = "0.1.0";
 const float MIN_SOC_FOR_OTA = 30.0f;
+
+// Bench-testing escape hatch: when defined, skips the SoC + fault + has-data
+// prechecks so you can OTA a master that has no slave attached. Leave it
+// commented in any image that gets used with real cells.
+#define OTA_SKIP_SAFETY_CHECKS
 
 // ==================== HARDWARE CONFIG ====================
 const int I2C_SDA_PIN = 21; // Standard I2C SDA on ESP32 DevKit V1
