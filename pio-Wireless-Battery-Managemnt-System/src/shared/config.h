@@ -24,11 +24,17 @@ const char *const MQTT_PASSWORD = "mito1234";
 const uint32_t MQTT_RECONNECT_INTERVAL_MS = 5000;
 
 // ==================== HARDWARE CONFIG ====================
-const int I2C_SDA_PIN = 21; // Standard I2C SDA on ESP32 DevKit V1
-const int I2C_SCL_PIN = 22; // Standard I2C SCL on ESP32 DevKit V1
+// Mainboard PCB pinout (ESP32-S3): SDA=12, SCL=13. Same wiring as
+// mainboard_dashboard/tb_config.h so the slave sketch and dashboard sketch
+// are interchangeable on the same hardware.
+const int I2C_SDA_PIN = 12;
+const int I2C_SCL_PIN = 13;
 
 // ==================== BMS CONFIG ====================
-#define CONNECTED_CELLS 3
+// 13S3P pack: cells 1..12 wired to VC1..VC12, cell 13 wired to VC16
+// (VC13..VC15 are shorted to VC12). Parallel groups (3P) do not affect
+// per-cell voltage reads — only current/Ah scaling on the consumer side.
+#define CONNECTED_CELLS 13
 
 const uint8_t RECEIVER_ADDRESS[] = {0x3C, 0x8A, 0x1F, 0x0C, 0xD5, 0x28};
 

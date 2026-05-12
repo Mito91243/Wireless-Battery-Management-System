@@ -140,8 +140,13 @@ uint16_t minCellV = 0;
 uint16_t maxCellV = 0;
 
 // ==================== EKF DATA ====================
-BatteryEKF ekf(1.0f); // 1 second sample time (was 10s)
-float soc_ekf = 0.0f;
+BatteryEKF ekfArray[13] = {
+    BatteryEKF(1.0f), BatteryEKF(1.0f), BatteryEKF(1.0f), BatteryEKF(1.0f),
+    BatteryEKF(1.0f), BatteryEKF(1.0f), BatteryEKF(1.0f), BatteryEKF(1.0f),
+    BatteryEKF(1.0f), BatteryEKF(1.0f), BatteryEKF(1.0f), BatteryEKF(1.0f),
+    BatteryEKF(1.0f)
+};
+float pack_soc_target = 0.0f;
 float soc_uncertainty = 0.0f;
 float voltage_error_ekf = 0.0f;
 float initial_ekf_soc = -1.0f;   // Stores the boot SOC from the EKF
@@ -158,65 +163,87 @@ uint32_t perf_web_us = 0;
 uint32_t web_peak_us = 0;
 
 // Helper function for smart SOC initialization
-float smartSOCInit(float V_measured, float I_current) {
-  // Use only the true internal resistance of the Samsung 30Q (20mOhm)
-  // No fake wire compensation!
-  float R_cell = 0.020f; 
+float smartSOCInit(float I_current) {
+  // Physics Fix: The internal resistance must be divided by 3 because this is a 3-Parallel (3P) pack
+  float R_cell = 0.020f / 3.0f; 
+  float total_soc = 0.0f;
 
-  float drop_V = abs(I_current) * R_cell;
-  float V_corrected;
-  
-  if (I_current < 0) {
-      V_corrected = V_measured + drop_V; // Discharge
-  } else {
-      V_corrected = V_measured - drop_V; // Charge
+  for (int i = 0; i < 13; i++) {
+    float V_measured = (float)cellVoltages[i] / 1000.0f;
+    float drop_V = abs(I_current) * R_cell;
+    float V_corrected;
+    
+    if (I_current < 0) {
+        V_corrected = V_measured + drop_V; // Discharge
+    } else {
+        V_corrected = V_measured - drop_V; // Charge
+    }
+
+    // Invert OCV table for accurate initialization for that specific cell
+    float cell_soc_init = ekfArray[i].invertOCV_Discharge(V_corrected);
+    cell_soc_init = constrain(cell_soc_init, 0.0f, 100.0f);
+    
+    ekfArray[i].begin(cell_soc_init);
+    total_soc += cell_soc_init;
+
+    Serial.printf("[EKF %d] Smart Init (OCV lookup): V=%.3fV (raw=%.3fV), I=%.2fA -> SOC~%.1f%%\n",
+                  i, V_corrected, V_measured, I_current, cell_soc_init);
   }
-
-  // Invert OCV table for accurate initialization
-  float soc_init = ekf.invertOCV_Discharge(V_corrected);
-
-  Serial.printf("[EKF] Smart Init (OCV lookup): V=%.3fV (raw=%.3fV), I=%.2fA "
-                "-> SOC~%.1f%%\n",
-                V_corrected, V_measured, I_current, soc_init);
-  return constrain(soc_init, 0.0f, 100.0f);
+  
+  return total_soc / 13.0f;
 }
 
 void updateEKF() {
-  float current_A =
-      (float)bmsCurrent / 1000.0f; // Re-enabled real current reading!
-  // YOUR HARDWARE FIX: 
-  // We abandon Cell 1 because its physical connection is compromised.
-  // We point the EKF at Cell 2 (index 1), which has a clean hardware path.
-  // We remove all "fake" parasitic software math.
-  float clean_voltage_V = (float)cellVoltages[1] / 1000.0f; 
+  float current_A = (float)bmsCurrent / 1000.0f; // Re-enabled real current reading!
 
   // Use cell thermistor (temp3) if valid, else fallback to chipTemp
   float ekf_temp = (temp3 > -40.0f && temp3 < 100.0f) ? temp3 : chipTemp;
   
-  // Feed the pure, unedited Cell 2 voltage straight into the EKF
-  ekf.update(current_A, clean_voltage_V, ekf_temp);
-  soc_ekf = ekf.getSOC();
-  soc_uncertainty = ekf.getSOCUncertainty();
-  voltage_error_ekf = ekf.getVoltageError() * 1000.0f;
+  float min_soc = 100.0f;
+  float max_soc = 0.0f;
+  float total_soc = 0.0f;
+  
+  // 1. --- NEW: 13-CORE EKF MATRIX LOOP ---
+  for (int i = 0; i < 13; i++) {
+      float cell_V = (float)cellVoltages[i] / 1000.0f;
+      // Physics Fix: divide pack current by 3 before feeding it to the EKF
+      ekfArray[i].update(current_A / 3.0f, cell_V, ekf_temp);
+      
+      float cell_soc = ekfArray[i].getSOC();
+      if (cell_soc < min_soc) min_soc = cell_soc;
+      if (cell_soc > max_soc) max_soc = cell_soc;
+      total_soc += cell_soc;
+  }
+  
+  float avg_soc = total_soc / 13.0f;
 
-  // 2. --- NEW: UPDATE SOH ENGINE ---
+  // 2. --- NEW: BOUNDARY LOGIC (PACK TARGET) ---
+  if (current_A < -0.1f) {
+      pack_soc_target = min_soc; // Bounded by weakest link on discharge
+  } else if (current_A > 0.1f) {
+      pack_soc_target = max_soc; // Bounded by strongest link on charge to prevent overcharge
+  } else {
+      pack_soc_target = avg_soc; // Resting
+  }
+
+  soc_uncertainty = ekfArray[0].getSOCUncertainty();
+  voltage_error_ekf = ekfArray[0].getVoltageError() * 1000.0f;
+
+  // 3. --- NEW: UPDATE SOH ENGINE ---
   // We know this function runs every EKF_UPDATE_INTERVAL (1000ms = 1.0 seconds)
   float dt_seconds = EKF_UPDATE_INTERVAL / 1000.0f; 
   
-  // Feed the micro-accumulator the exact current and temp for this 1-second window
+  // Feed the micro-accumulator the FULL exact current and temp for this 1-second window
+  // (Do not divide by 3! It tracks the total thermal mass moved)
   sohEngine.trackEnvironmentalDamage(current_A, ekf_temp, dt_seconds);
-  
-  // Update the Piecewise Math (Calculates the % based on accumulated damage)
   sohEngine.calculatePiecewiseSOH();
 
-  Serial.printf(
-      "[EKF/SOH] I=%.3fA, V=%.3fV -> SOC=%.1f%% | SOH=%.2f%% (EqCycles=%.2f)\n",
-      current_A, clean_voltage_V, soc_ekf, sohEngine.getSOH(), sohEngine.getEquivalentCycles());
+  // [EKF MATRIX] verbose log suppressed — see clean BMS readout in loop()
+  (void)min_soc; (void)max_soc; (void)avg_soc;
 
-  // 3. --- NEW: HYBRID SOC SYNCHRONIZATION ---
+  // 4. --- NEW: HYBRID SOC SYNCHRONIZATION ---
   // Rule 2 (At Rest): If the battery has been at rest (0A) for 3 minutes,
   // the EKF uncertainty drops to zero and we trust it to read the perfect chemical OCV.
-  // We silently snap the Coulomb Counter back to reality!
   static uint32_t rest_seconds = 0;
   if (current_A == 0.0f) {
       rest_seconds++;
@@ -225,15 +252,15 @@ void updateEKF() {
   }
 
   if (rest_seconds == 180) { // Exactly 3 minutes
-      initial_ekf_soc = soc_ekf;            // Snap base SOC to EKF
+      initial_ekf_soc = pack_soc_target;    // Snap base SOC to EKF Target
       bms.CommandOnlysubCommand(0x0082);    // RESET_PASSQ (Reset Hardware CC1)
       last_cc_reset_time = millis();        // Guard transient CC reads
       software_charge_Ah = 0.0f;            // Clear software integrators
       charge = 0.0f;
-      Serial.printf("[HYBRID] Rest Sync Complete! CC SOC snapped to pure EKF OCV: %.1f%%\n", soc_ekf);
+      Serial.printf("[HYBRID] Rest Sync Complete! CC SOC snapped to EKF Target: %.1f%%\n", pack_soc_target);
   }
 
-  // 3. --- NEW: NVS PERIODIC SAVE ---
+  // 5. --- NEW: NVS PERIODIC SAVE ---
   // Save to flash every 15 minutes of continuous operation
   static unsigned long last_soh_save = 0;
   if (millis() - last_soh_save >= 900000) { // 900,000 ms = 15 minutes
@@ -242,27 +269,27 @@ void updateEKF() {
       Serial.println("[NVS] Periodic 15-min SOH save to Flash completed.");
   }
 
-  // 4. --- NEW: SOC SLEW RATE LIMITER ---
-  // THE SLEW RATE LIMITER (0.01% max step per loop)
+  // 6. --- NEW: SOC SLEW RATE LIMITER ---
+  // THE SLEW RATE LIMITER (0.01% max step per loop) chasing pack_soc_target
   if (bmsCurrent < -100) { 
       // DISCHARGING: Battery can ONLY go down. 
-      // If EKF is lower, tick down. If EKF is magically higher, ignore it.
-      if (soc_display > soc_ekf) soc_display -= 0.01f; 
+      if (soc_display > pack_soc_target) soc_display -= 0.01f; 
   } 
   else if (bmsCurrent > 100) {
       // CHARGING: Battery can ONLY go up.
-      if (soc_display < soc_ekf) soc_display += 0.01f;
+      if (soc_display < pack_soc_target) soc_display += 0.01f;
   } 
   else {
       // RESTING: Allow slow convergence in both directions to fix drift
-      if (soc_display > soc_ekf + 0.5f) soc_display -= 0.01f;
-      if (soc_display < soc_ekf - 0.5f) soc_display += 0.01f;
+      if (soc_display > pack_soc_target + 0.5f) soc_display -= 0.01f;
+      if (soc_display < pack_soc_target - 0.5f) soc_display += 0.01f;
   }
 
   // Calculate Time-To-Empty (TTE)
   if (bmsCurrent < -500) { // If pulling more than 0.5A
       float current_A_abs = abs((float)bmsCurrent / 1000.0f);
-      float remaining_Ah = (soc_display / 100.0f) * 3.043f; // 3.043 = Samsung 30Q Nom
+      // Fixed for 3P pack: 3.043Ah per cell * 3 cells in parallel
+      float remaining_Ah = (soc_display / 100.0f) * (3.043f * 3.0f); 
       time_to_empty_mins = (remaining_Ah / current_A_abs) * 60.0f;
   } else {
       time_to_empty_mins = 999.0f; // Infinite/Resting
@@ -431,13 +458,23 @@ void readBMSData() {
   maxCellV = 0;
   for (int i = 0; i < TB_CONNECTED_CELLS; i++) {
     uint16_t rawV = bms.getCellVoltage(CELL_TO_BQ[i]);
-    
+
+    // DIAG: log raw read for cell 12 (BQ pin 15) so we can see what BQ returns
+    // before the glitch filter latches a value
+    if (i == 11) {
+      static uint32_t lastC12Log = 0;
+      if (millis() - lastC12Log > 1000) {
+        Serial.printf("[DBG] C12 raw (BQ pin 15) = %u mV\n", rawV);
+        lastC12Log = millis();
+      }
+    }
+
     // GLITCH FILTER: Discard insane values (I2C noise) to prevent phantom safety faults
     if (rawV > 500 && rawV < 5000) {
       cellVoltages[i] = rawV;
     } else {
       // If glitch detected, we stick with the previous value to prevent watchdog trip
-      if (cellVoltages[i] == 0) cellVoltages[i] = rawV; 
+      if (cellVoltages[i] == 0) cellVoltages[i] = rawV;
     }
 
     if (cellVoltages[i] > 0 && cellVoltages[i] < minCellV)
@@ -574,9 +611,7 @@ void readBMSData() {
   // which prevents the 'Quantum Observation' collision.
   balancingMask = currentMask; 
 
-  // Clean output for Arduino Serial Plotter
-  Serial.printf("Pack_V:%.2f Current_mA:%d Die_Temp:%.1f\n", vPack / 1000.0,
-                bmsCurrent, chipTemp);
+  // Per-ALERT plotter line suppressed — clean 1 Hz readout lives in loop()
 }
 
 // ==================== HOST BALANCING LOGIC ====================
@@ -799,49 +834,22 @@ void setup() {
       "[TB-Dash] Loaded Host Balancing Settings: Trigger=%dmV, Delta=%dmV\n",
       hostBalTriggerMv, hostBalDeltaMv);
 
-  // ==================== WiFi Setup ====================
-  // ORIGINAL AP-ONLY MODE (uncomment for production / mainboard):
-  // WiFi.mode(WIFI_AP);
-  // WiFi.softAP(TB_AP_SSID, TB_AP_PASSWORD);
-  // Serial.printf("[TB-Dash] AP: %s  IP: http://%s\n", TB_AP_SSID,
-  //               WiFi.softAPIP().toString().c_str());
-
-  // TESTING: AP+STA mode — dashboard AP + home WiFi at the same time
-  if (strlen(TB_STA_SSID) > 0) {
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(TB_AP_SSID, TB_AP_PASSWORD);
-    WiFi.begin(TB_STA_SSID, TB_STA_PASSWORD);
-    Serial.printf("[TB-Dash] AP: %s  IP: http://%s\n", TB_AP_SSID,
-                  WiFi.softAPIP().toString().c_str());
-    Serial.printf("[TB-Dash] Connecting to home WiFi: %s...\n", TB_STA_SSID);
-    
-    unsigned long wifiStart = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
-      delay(250);
-      Serial.print(".");
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("\n[TB-Dash] Connected! STA IP: http://%s\n",
-                    WiFi.localIP().toString().c_str());
-    } else {
-      Serial.println("\n[TB-Dash] STA connection failed, AP still active");
-    }
-  } else {
-    // Fallback to AP-only if no STA credentials set
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(TB_AP_SSID, TB_AP_PASSWORD);
-    Serial.printf("[TB-Dash] AP: %s  IP: http://%s\n", TB_AP_SSID,
-                  WiFi.softAPIP().toString().c_str());
-  }
+  // ==================== WiFi Setup (AP-only) ====================
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(TB_AP_SSID, TB_AP_PASSWORD);
+  Serial.printf("[TB-Dash] AP: %s  IP: http://%s\n", TB_AP_SSID,
+                WiFi.softAPIP().toString().c_str());
 
   Wire.begin(TB_I2C_SDA, TB_I2C_SCL, 400000); // Back to 400kHz
   bms.begin(TB_I2C_SDA, TB_I2C_SCL);
   bms.setDebug(false);
 
   // Set EKF Configuration (User Review Recommendations)
-  ekf.setParasiticResistance(0.0f);   // Handled manually in updateEKF() now
-  ekf.setTrustGuardThreshold(0.120f); // Guard against pulse noise >120mV
-  ekf.setMaxGainClamp(0.5f);          // 0.5% max SOC change per loop
+  for (int i = 0; i < 13; i++) {
+    ekfArray[i].setParasiticResistance(0.0f);   // Handled manually in updateEKF() now
+    ekfArray[i].setTrustGuardThreshold(0.120f); // Guard against pulse noise >120mV
+    ekfArray[i].setMaxGainClamp(0.5f);          // 0.5% max SOC change per loop
+  }
 
   Serial.printf("[TB-Dash] I2C Master SDA=%d SCL=%d\n", TB_I2C_SDA, TB_I2C_SCL);
 
@@ -901,14 +909,16 @@ void setup() {
   // 3. Smart Boot
   if (soc_display == 0.0f) {
       // First ever boot, force the EKF to guess based on voltage
-      soc_display = smartSOCInit(cellVoltages[1] / 1000.0f, 0.0f);
+      soc_display = smartSOCInit(0.0f);
   }
 
   // 4. Force the internal EKF to match the saved User Display to start
   initial_ekf_soc = soc_display;
-  ekf.setNNEnabled(true);
-  ekf.setAdaptiveTuning(true);
-  ekf.begin(soc_display);
+  for (int i = 0; i < 13; i++) {
+    ekfArray[i].setNNEnabled(true);
+    ekfArray[i].setAdaptiveTuning(true);
+    ekfArray[i].begin(soc_display);
+  }
   Serial.printf("[EKF] Initialized with SOC=%.1f%%\n", soc_display);
 
   // --- NEW: INITIALIZE SOH ENGINE ---
@@ -1033,6 +1043,28 @@ void loop() {
     // UI monitoring
     perf_web_us = web_peak_us;
     web_peak_us = 0;
+
+    // ==================== CLEAN BMS READOUT (1 Hz) ====================
+    uint16_t cellMin = 65535, cellMax = 0;
+    for (int i = 0; i < 13; i++) {
+      if (cellVoltages[i] < cellMin) cellMin = cellVoltages[i];
+      if (cellVoltages[i] > cellMax) cellMax = cellVoltages[i];
+    }
+    Serial.printf("\n===== BMS @ %lus =====\n", millis() / 1000);
+    Serial.printf("C01:%-5u C02:%-5u C03:%-5u C04:%-5u C05:%-5u\n",
+                  cellVoltages[0], cellVoltages[1], cellVoltages[2],
+                  cellVoltages[3], cellVoltages[4]);
+    Serial.printf("C06:%-5u C07:%-5u C08:%-5u C09:%-5u C10:%-5u\n",
+                  cellVoltages[5], cellVoltages[6], cellVoltages[7],
+                  cellVoltages[8], cellVoltages[9]);
+    Serial.printf("C11:%-5u C12:%-5u C13:%-5u   (mV)\n",
+                  cellVoltages[10], cellVoltages[11], cellVoltages[12]);
+    Serial.printf("min:%u  max:%u  delta:%u mV\n",
+                  cellMin, cellMax, (uint16_t)(cellMax - cellMin));
+    Serial.printf("Pack:%.2fV  I:%dmA  T:%.1fC\n",
+                  vPack / 1000.0f, bmsCurrent, chipTemp);
+    Serial.printf("SOC:%.1f%%  Target:%.1f%%  SOH:%.2f%%\n",
+                  soc_display, pack_soc_target, sohEngine.getSOH());
   }
   delay(2);
 }

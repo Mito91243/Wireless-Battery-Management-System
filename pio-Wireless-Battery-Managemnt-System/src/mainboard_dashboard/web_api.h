@@ -457,15 +457,16 @@ void handleApiEKFReset() {
     return;
   }
 
-  float V_cell = (float)cellVoltages[1] / 1000.0f;
   float I_current = (float)bmsCurrent / 1000.0f;
-  float soc_est = smartSOCInit(V_cell, I_current);
+  float soc_est = smartSOCInit(I_current);
 
   initial_ekf_soc = soc_est;
   software_charge_Ah = 0.0f; // Reset our robust software CC!
   bms.ResetAccumulatedCharge();
   last_cc_reset_time = millis();
-  ekf.begin(soc_est);
+  for (int i = 0; i < 13; i++) {
+    ekfArray[i].begin(soc_est);
+  }
 
   String response = "{\"status\":\"ok\",\"new_soc\":" + String(soc_est) + "}";
   server.send(200, "application/json", response);

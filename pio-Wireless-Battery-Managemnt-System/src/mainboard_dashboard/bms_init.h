@@ -38,7 +38,16 @@ inline void initBQ76952() {
   bms.CommandOnlysubCommand(0x0092);     // EXIT_CFGUPDATE
   delay(200);
   bms.setConnectedCells(TB_CONNECTED_CELLS);
-  bms.writeIntToMemory(0x9304, VCELL_MODE_13S);  // 13S: Cells 1-11, 15, 16 (0xC7FF)
+  bms.writeIntToMemory(0x9304, VCELL_MODE_13S);  // 13S: Cells 1-12, 16 (0x8FFF)
+  delay(50);
+
+  // Verify VCell_Mode actually latched (must be 0xC7FF for cells 12/13 on VC15/VC16)
+  byte *vcm = bms.readDataMemory(0x9304);
+  if (vcm)
+    Serial.printf("[BMS-INIT] VCell_Mode readback: 0x%02X%02X (expect 0xC7FF)\n",
+                  vcm[1], vcm[0]);
+  else
+    Serial.println("[BMS-INIT] VCell_Mode readback FAILED (null)");
 
   // 3. Thermistors
   Serial.println("[BMS-INIT] Thermistors: TS1+TS3+HDQ+CFETOFF = NTC10K, TS2 OFF");

@@ -21,16 +21,15 @@ const int TB_CONNECTED_CELLS = 13;
 const uint32_t TB_UPDATE_INTERVAL_MS = 500;
 
 // BQ76952 Cell Pin Mapping for 13S configuration:
-//   Cells 1-11  → VC1 through VC11 (normal)
-//   VC12, VC13, VC14 are shorted to VC11 (unused/bypassed)
-//   Cell 12     → VC15-VC14 (reads VC15 minus VC11)
-//   Cell 13     → VC16-VC15
-const uint8_t CELL_TO_BQ[13]      = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 16};
-const uint8_t CELL_TO_BAL_BIT[13] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 15};
+//   Cells 1-12  → VC1 through VC12 (normal)
+//   VC13, VC14, VC15 are shorted to VC12 (unused/bypassed)
+//   Cell 13     → VC16-VC15 (reads VC16 minus VC12 through the shorted chain)
+const uint8_t CELL_TO_BQ[13]      = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16};
+const uint8_t CELL_TO_BAL_BIT[13] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15};
 
-// Vcell Mode register value: enable cells 1-11, 15, 16 / disable 12-14
-// Binary: 1100_0111_1111_1111 = 0xC7FF
-const uint16_t VCELL_MODE_13S = 0xC7FF;
+// Vcell Mode register value: enable cells 1-12, 16 / disable 13-15
+// Binary: 1000_1111_1111_1111 = 0x8FFF
+const uint16_t VCELL_MODE_13S = 0x8FFF;
 
 // ==================== INDICATOR LED PINS ====================
 const int TB_PIN_CHG_EXT_LED = 47; // Charge process indicator LED
