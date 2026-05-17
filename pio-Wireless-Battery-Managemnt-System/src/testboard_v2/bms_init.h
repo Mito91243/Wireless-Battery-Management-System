@@ -39,8 +39,11 @@ inline void initBQ76952() {
   delay(100);
   bms.CommandOnlysubCommand(0x0092);     // EXIT_CFGUPDATE
   delay(200);
-  bms.setConnectedCells(TB_CONNECTED_CELLS);
-  bms.writeIntToMemory(0x9304, 0x8003);  // Cells 1, 2, 16
+  if (TB_CONNECTED_CELLS == 3) {
+    bms.writeIntToMemory(0x9304, 0x8003);  // Cells 1, 2, 16 for 3-cell testboard
+  } else {
+    bms.setConnectedCells(TB_CONNECTED_CELLS); // Dynamic mask for 13 cells
+  }
 
   // 3. Thermistors
   Serial.println("[BMS-INIT] Thermistors: TS1/TS2 OFF, HDQ+TS3 = NTC10K");
@@ -118,7 +121,7 @@ inline void initBQ76952() {
   bms.writeIntToMemory(0x9343, 0x0050);
   delay(50);
 
-  // CFETOFF / DFETOFF hardware pin enable (Lobotomized)
+  // CFETOFF / DFETOFF hardware pin enable (Disabled — Indicators Only)
   bms.writeByteToMemory(0x92FA, 0x00);
   bms.writeByteToMemory(0x92FB, 0x00);
   delay(50);
@@ -134,11 +137,21 @@ inline void initBQ76952() {
   bms.writeByteToMemory(0x9302, 0x00); // DDSG Pin = Disabled
   delay(50);
 
+  // Set DA Configuration (0x9303) to 0x04:
+  // Bit 2: USER_VOLTS_CV = 1 (10mV units for pack voltage)
+  // Bits 1-0: USER_AMPS_1:0 = 0 (100uA/0.1mA resolution)
+  bms.writeByteToMemory(0x9303, 0x04);
+  delay(50);
+
+  // Set CC3 filter to average 50 samples for perfectly smooth UI current
+  bms.writeByteToMemory(0x9307, 50);
+  delay(50);
+
   // 7. DYNAMIC BALANCING MODE (Restart-to-Apply)
   // FORCED TO HOST ALGO FOR DEBUGGING
   int savedBalMode = prefs.getInt("bal_mode", BAL_MODE_HOST_ALGO);
-  currentBalMode = BAL_MODE_HOST_ALGO; // FORCED
-  balancingEnabled = true; // FORCED
+  currentBalMode = (BalancingMode)savedBalMode;
+  balancingEnabled = prefs.getBool("bal_master", true);
   bool balChg = prefs.getBool("bal_chg", true);
   bool balRlx = prefs.getBool("bal_rlx", true);
 

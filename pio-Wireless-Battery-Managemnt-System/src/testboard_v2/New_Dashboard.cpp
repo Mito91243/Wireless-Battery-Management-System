@@ -34,7 +34,48 @@ uint16_t safeReadSubCommand(uint16_t command, uint8_t length) {
   return result;
 }
 
+// ---------------------------------------------------------
+// SUBCOMMAND: 0x0075 DASTATUS5 (CC3 Current)
+// Uses the MAC engine to trigger a fresh CC3 calculation, 
+// but "snipes" only the 2 bytes we need to save I2C bandwidth.
+// ---------------------------------------------------------
+int getCC3CurrentOptimized() {
+  // Guard: For the first 3 seconds of boot, the BQ76952 CC3 hardware filter
+  // is still collecting its 50 samples and will return massive garbage spikes.
+  // We use the instantaneous CC2 (0x3A) until CC3 is fully stabilized.
+  if (millis() < 3000) {
+    return (int)((int16_t) bms.directCommandRead(0x3A));
+  }
 
+  // 1. Trigger the DASTATUS5 subcommand
+  Wire.beginTransmission(0x08);
+  Wire.write(0x3E);       // Subcommand Register
+  Wire.write(0x75);       // Lower byte of 0x0075
+  Wire.write(0x00);       // Upper byte of 0x0075
+  Wire.endTransmission();
+
+  // 2. Wait for the BQ76952 MAC engine to populate the buffer
+  // The TRM specifies ~660µs execution time for DASTATUS commands.
+  delayMicroseconds(1000); 
+
+  // 3. Snipe the CC3 Data. 
+  // The buffer starts at 0x40. CC3 is at offset 20. (0x40 + 0x14 = 0x54)
+  // (Note: Offset 24/0x58 is CC2 Counts, CC3 Current is offset 20/0x54)
+  Wire.beginTransmission(0x08);
+  Wire.write(0x54);       
+  Wire.endTransmission(false);
+  
+  Wire.requestFrom((int)0x08, 2);
+  if (Wire.available() >= 2) {
+    uint8_t lowByte = Wire.read();
+    uint8_t highByte = Wire.read();
+    
+    // Combine and cast to signed integer to support charging/discharging
+    int16_t cc3_current = (int16_t)((highByte << 8) | lowByte);
+    return (int)cc3_current;
+  }
+  return 0; // Failsafe
+}
 
 // ==================== CACHED BMS DATA ====================
 unsigned int cellVoltages[16];
@@ -136,7 +177,7 @@ float smartSOCInit(float V_measured, float I_current) {
 
 void updateEKF() {
   float current_A =
-      (float)bmsCurrent / 1000.0f; // Re-enabled real current reading!
+      (float)bmsCurrent / 10000.0f; // CC3 current is in 0.1mA units (100uA)
   float voltage_V = (float)cellVoltages[0] / 1000.0f; // Use cell 1 for EKF
   ekf.update(current_A, voltage_V);
   soc_ekf = ekf.getSOC();
@@ -323,11 +364,11 @@ void readBMSData() {
 
   vStack = bms.getCellVoltage(17);
   vPack = bms.getCellVoltage(18);
-  bmsCurrent = bms.getCurrent();
+  bmsCurrent = getCC3CurrentOptimized();
 
-  // TRM Section 7.3: CC2 ADC noise sigma ~12µV at WK_SPD=0.
-  // With 1mΩ shunt: 12µV / 1mΩ = 12mA noise. Apply 2-sigma deadband (±20mA).
-  if (abs(bmsCurrent) <= 20)
+  // CC3 is filtered value in 0.1mA units (100µA resolution).
+  // Apply a 100µA (1 count) deadband to kill ambient noise.
+  if (abs(bmsCurrent) <= 1)
     bmsCurrent = 0;
   chipTemp = bms.getInternalTemp();
   temp1 = 0.0;                        // TS1 is disabled in config
@@ -346,7 +387,7 @@ void readBMSData() {
   if (last_cc_update != 0) {
     float dt_h = (now_cc - last_cc_update) / 3600000.0f;
     // We integrate actual current to completely bypass BQ CC scaling bugs
-    software_charge_Ah += ((float)bmsCurrent / 1000.0f) * dt_h;
+    software_charge_Ah += ((float)bmsCurrent / 10000.0f) * dt_h;
   }
   last_cc_update = now_cc;
 
@@ -361,6 +402,8 @@ void readBMSData() {
     if (currentBalMode == BAL_MODE_AUTONOMOUS) {
       bms.GetCellBalancingTimes(cellBalancingTimes);
     }
+    // Poll Manufacturing Status (0x0057) for FET_EN and SEALING status
+    manufStatus = safeReadSubCommand(0x0057, 2); 
     slowPollCounter = 0;
   }
 
@@ -378,14 +421,13 @@ void readBMSData() {
   isCharging = (isChgOn != 0) || (isPchgOn != 0);
   isDischarging = (isDsgOn != 0) || (isPdsgOn != 0);
 
-  // Drive the original physical LEDs from the ESP32 (Active LOW)
-  digitalWrite(TB_PIN_DCHG_LED, isCharging ? LOW : HIGH);
-  digitalWrite(TB_PIN_DDSG_LED, isDischarging ? LOW : HIGH);
+  // Drive the original physical LEDs from the ESP32 (Active HIGH)
+  digitalWrite(TB_PIN_DCHG_LED, isCharging ? HIGH : LOW);
+  digitalWrite(TB_PIN_DDSG_LED, isDischarging ? HIGH : LOW);
 
-  // Drive your newly wired external LEDs on GPIO 4 and 2 (Assuming Active HIGH)
+  // Drive your newly wired external LEDs on GPIO 4 and 2 (Indicator Mode Only)
   digitalWrite(TB_PIN_CHG_EXT_LED, isCharging ? HIGH : LOW);
   digitalWrite(TB_PIN_DSG_EXT_LED, isDischarging ? HIGH : LOW);
-
 
   // ==================== WATCHDOG LOGIC ====================
   // Read Safety Status FIRST to decide whether to clear the ALERT latch.
@@ -517,26 +559,34 @@ void hostBalancingLoop() {
       }
     }
 
-    if (showDiag) Serial.println("[HOST-BAL-TRACE] Phase 2: Adjacent cell resolution...");
-    // Phase 2: ADJACENT CELL RESOLUTION (The TRM Fix)
-    if (showDiag) Serial.println("[HOST-BAL-TRACE] Phase 2: Bitwise Adjacency Resolution...");
-    // Phase 2: BITWISE ADJACENCY RESOLUTION
+    // Phase 2: BITWISE ADJACENCY RESOLUTION (The Silicon Fix)
     // The BQ76952 silicon forbids balancing adjacent VC nodes (e.g., VC1 and VC2).
-    // This loop scans the 16-bit mask for any N and N+1 conflicts and keeps the highest voltage cell.
+    // We map voltages to their actual BQ bit positions to resolve conflicts.
+    uint16_t voltagesByBit[16] = {0};
+    for (int j = 0; j < TB_CONNECTED_CELLS; j++) {
+      int bit = (j == TB_CONNECTED_CELLS - 1) ? 15 : j; // Last cell is always VC16
+      voltagesByBit[bit] = cellVoltages[j];
+    }
+
     for (int i = 0; i < 15; i++) {
       if (wantsBalance[i] && wantsBalance[i + 1]) {
-        // Voltage Lookup
-        int vA = (i == 0) ? cellVoltages[0] : (i == 1) ? cellVoltages[1] : (i == 15) ? cellVoltages[2] : 0;
-        int vB = (i+1 == 0) ? cellVoltages[0] : (i+1 == 1) ? cellVoltages[1] : (i+1 == 15) ? cellVoltages[2] : 0;
-
-        if (showDiag) Serial.printf("[HOST-BAL-TRACE] Conflict: VC%d (%dmV) vs VC%d (%dmV)\n", i+1, vA, i+2, vB);
-        
-        if (vA >= vB) {
-          wantsBalance[i+1] = false;
-          if (showDiag) Serial.printf("[HOST-BAL-TRACE] Dropping VC%d\n", i+2);
+        if (voltagesByBit[i] >= voltagesByBit[i + 1]) {
+          wantsBalance[i + 1] = false;
         } else {
           wantsBalance[i] = false;
-          if (showDiag) Serial.printf("[HOST-BAL-TRACE] Dropping VC%d\n", i+1);
+        }
+      }
+    }
+
+    // For cell counts < 16, the last active cell before VC16 (index TB_CONNECTED_CELLS - 2)
+    // and VC16 (index 15) are physically adjacent on the board's wiring.
+    if (TB_CONNECTED_CELLS < 16) {
+      int lastVcBit = TB_CONNECTED_CELLS - 2;
+      if (wantsBalance[lastVcBit] && wantsBalance[15]) {
+        if (voltagesByBit[lastVcBit] >= voltagesByBit[15]) {
+          wantsBalance[15] = false;
+        } else {
+          wantsBalance[lastVcBit] = false;
         }
       }
     }
@@ -703,7 +753,7 @@ void setup() {
   // 4. Initialize the EKF Math Engine
   readBMSData(); // Refresh cell voltages once for init
   float V_init = (float)cellVoltages[0] / 1000.0f;
-  float I_init = (float)bmsCurrent / 1000.0f;
+  float I_init = (float)bmsCurrent / 10000.0f;
   float SOC_init = smartSOCInit(V_init, I_init);
   initial_ekf_soc = SOC_init;
   ekf.setNNEnabled(true);
@@ -711,17 +761,18 @@ void setup() {
   ekf.begin(SOC_init);
   Serial.printf("[EKF] Initialized with SOC=%.1f%%\n", SOC_init);
 
-  // Initialize original testboard LEDs (Assuming active-low)
+  // Initialize original testboard LEDs (Active-HIGH logic)
   pinMode(TB_PIN_DDSG_LED, OUTPUT);
   pinMode(TB_PIN_DCHG_LED, OUTPUT);
-  digitalWrite(TB_PIN_DDSG_LED, HIGH);
-  digitalWrite(TB_PIN_DCHG_LED, HIGH);
+  digitalWrite(TB_PIN_DDSG_LED, LOW); // Default OFF
+  digitalWrite(TB_PIN_DCHG_LED, LOW); // Default OFF
 
-  // Initialize your NEW external LEDs (Assuming active-high, adjust if needed)
-  pinMode(TB_PIN_CHG_EXT_LED, OUTPUT);
-  pinMode(TB_PIN_DSG_EXT_LED, OUTPUT);
-  digitalWrite(TB_PIN_CHG_EXT_LED, LOW); // Default OFF
-  digitalWrite(TB_PIN_DSG_EXT_LED, LOW); // Default OFF
+  // Initialize FET Hardware Override Pins (Active-HIGH for BLOCKING)
+  // Pin 4 = CFETOFF, Pin 2 = DFETOFF
+  pinMode(TB_PIN_CFETOFF, OUTPUT);
+  pinMode(TB_PIN_DFETOFF, OUTPUT);
+  digitalWrite(TB_PIN_CFETOFF, LOW); // RELEASE BLOCK (Allow CHG)
+  digitalWrite(TB_PIN_DFETOFF, LOW); // RELEASE BLOCK (Allow DSG)
 
   Serial.printf("[TB-Dash] LED Pins: DDSG_LED=GPIO%d (OUTPUT SINK), "
                 "DCHG_LED=GPIO%d (OUTPUT SINK)\n",

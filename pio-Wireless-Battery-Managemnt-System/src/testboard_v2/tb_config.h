@@ -14,7 +14,7 @@ const char *const TB_AP_SSID = "wBMS-TestBoard";
 const char *const TB_AP_PASSWORD = "wbms1234";
 
 // ==================== TEST BOARD CONFIG ====================
-const int TB_CONNECTED_CELLS = 3;
+const int TB_CONNECTED_CELLS = 13;
 const uint32_t TB_UPDATE_INTERVAL_MS = 500;
 
 // ==================== BQ76952 HARDWARE CONTROL PINS ====================
