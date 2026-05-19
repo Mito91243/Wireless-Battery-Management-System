@@ -108,40 +108,38 @@ void collectBMSData()
 // raw sensor configuration is identical so slave and dashboard read 1:1.
 void initBMS()
 {
-  // Wake + unseal so subsequent writes are accepted
-  bms.directCommandRead(0x12);
+  // 1. Wake + unseal so subsequent writes are accepted
+  bms.directCommandRead(0x12);       // Dummy read to wake I2C engine
   bms.CommandOnlysubCommand(0x009A); // SLEEP_DISABLE
   bms.unseal();
   delay(50);
 
-  // Power Config: LOOP_SLOW=3, SLEEP DISABLED (predictable for a continuous sender)
+  // 2. Power Config: LOOP_SLOW=3, SLEEP DISABLED (predictable for a continuous sender)
   bms.writeIntToMemory(0x9234, 0x298C);
   bms.writeIntToMemory(0x9237, 0);
   bms.writeByteToMemory(0x9236, 0x0D); // REG1 = 3.3V
 
-  // Cell config: 13 cells, VC1..VC12 + VC16
+  // 3. Cell config: 13 cells, VC1..VC12 + VC16.
+  // The setConnectedCells->EXIT_CFGUPDATE->setConnectedCells->VCELL_MODE
+  // sequence forces the BQ to latch VC16 enable; without it cell 13 reads
+  // 0xFCD0 garbage.
+  bms.setConnectedCells(CONNECTED_CELLS);
+  delay(100);
+  bms.CommandOnlysubCommand(0x0092); // EXIT_CFGUPDATE
+  delay(200);
   bms.setConnectedCells(CONNECTED_CELLS);
   bms.writeIntToMemory(0x9304, VCELL_MODE_13S);
   delay(50);
 
-  // DA Configuration: USER_VOLTS_CV=1 (10 mV pack V), USER_AMPS=0 (1 mA current)
-  bms.writeByteToMemory(DA_Configuration, 0x04);
-  // CC3 filter: average 50 samples for clean current readings
-  bms.writeByteToMemory(0x9307, 50);
+  // 4. Thermistor pin configs: TS1/TS3/HDQ/CFETOFF = NTC10K + 18k pull-up. TS2 OFF.
+  bms.writeByteToMemory(TS1_Config, 0x07);  // 0x92FD
+  bms.writeByteToMemory(TS2_Config, 0x00);  // 0x92FE
+  bms.writeByteToMemory(0x9300, 0x07);      // HDQ
+  bms.writeByteToMemory(TS3_Config, 0x07);  // 0x92FF
+  bms.writeByteToMemory(0x92FA, 0x07);      // CFETOFF as NTC10K
   delay(50);
 
-  // Thermistor pin configs: TS1/TS3/HDQ = NTC10K + 18k pull-up. TS2 OFF.
-  bms.writeByteToMemory(TS1_Config, 0x07);
-  bms.writeByteToMemory(TS2_Config, 0x00);
-  bms.writeByteToMemory(TS3_Config, 0x07);
-  bms.writeByteToMemory(0x9300, 0x07);     // HDQ as NTC10K
-  bms.writeByteToMemory(0x92FA, 0x07);     // CFETOFF as NTC10K
-  bms.writeByteToMemory(DFETOFF_Pin_Config, 0x00);
-  bms.writeByteToMemory(DCHG_Pin_Config, 0x00);
-  bms.writeByteToMemory(0x9302, 0x00);     // DDSG pin disabled
-  delay(50);
-
-  // Protection thresholds (Samsung 30Q + 1mΩ shunt — same as mainboard)
+  // 5. Protection thresholds (Samsung 30Q + 1mΩ shunt — same as mainboard)
   bms.writeByteToMemory(0x9275, 54); // CUV ~2.75 V
   bms.writeByteToMemory(0x9276, 74); // CUV delay ~250 ms
   bms.writeByteToMemory(0x9278, 81); // COV ~4.1 V
@@ -156,19 +154,45 @@ void initBMS()
   bms.writeByteToMemory(0x9287, 2);  // SCD delay ~15 us
   delay(50);
 
-  // Enable V/I protections, leave temperature protections OFF (mainboard parity)
+  // 6. Enable V/I protections, leave temperature protections OFF (mainboard parity)
   bms.writeByteToMemory(Enabled_Protections_A, 0xFC);
   bms.writeByteToMemory(Enabled_Protections_B, 0x00);
   bms.writeByteToMemory(Enabled_Protections_C, 0x00);
   delay(50);
 
-  // FET driver options + Mfg Status (FET_EN + PF_EN) so FETs stay enabled
+  // 7. FET driver options + Mfg Status (FET_EN + PF_EN) so FETs stay enabled
   // after CONFIG_UPDATE exits
   bms.writeByteToMemory(FET_Options, 0x0D);
   bms.writeIntToMemory(Mfg_Status_Init, 0x0050);
   delay(50);
 
-  // Clean integrator on boot
+  // 8. Pin configs: DFETOFF off, ALERT enabled, alarm masks armed, DCHG/DDSG disabled
+  bms.writeByteToMemory(DFETOFF_Pin_Config, 0x00); // 0x92FB
+  bms.writeByteToMemory(0x92FC, 0x2A);             // ALERT pin Active Drive + REG1 3.3V
+  bms.writeByteToMemory(0x926D, 0x01);             // Alarm Mask Low (Safety)
+  bms.writeByteToMemory(0x926E, 0x20);             // Alarm Mask High (FULLSCAN)
+  bms.writeByteToMemory(DCHG_Pin_Config, 0x00);    // 0x9301
+  bms.writeByteToMemory(0x9302, 0x00);             // DDSG pin disabled
+  delay(50);
+
+  // 9. DA Configuration: USER_VOLTS_CV=1 (10 mV stack/pack), USER_AMPS=0 (1 mA current).
+  // Written LATE (mirrors mainboard) so it isn't clobbered by intervening writes.
+  bms.writeByteToMemory(DA_Configuration, 0x04); // 0x9303
+  delay(50);
+  // CC3 filter: average 50 samples for clean current readings
+  bms.writeByteToMemory(0x9307, 50);
+  delay(50);
+
+  // 10. Re-arm: wake + clear/re-enable alarm masks so FULLSCAN keeps the
+  // measurement front-end refreshed
+  bms.directCommandRead(0x12);
+  bms.CommandOnlysubCommand(0x009A);
+  bms.directCommandWrite(0x62, 0xFF); // Clear Alarm Status Low
+  bms.directCommandWrite(0x63, 0xFF); // Clear Alarm Status High
+  bms.directCommandWrite(0x66, 0xFF); // Re-enable Alarm Enable Low
+  bms.directCommandWrite(0x67, 0xFF); // Re-enable Alarm Enable High
+
+  // 11. Clean integrator on boot
   bms.ResetAccumulatedCharge();
   delay(50);
 }
