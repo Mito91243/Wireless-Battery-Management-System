@@ -51,3 +51,6 @@ dist/
 # Package locks (optional, keep if you want reproducible installs)
 # package-lock.json
 # yarn.lock
+
+# local SSH deploy key — never commit
+id_ed25519

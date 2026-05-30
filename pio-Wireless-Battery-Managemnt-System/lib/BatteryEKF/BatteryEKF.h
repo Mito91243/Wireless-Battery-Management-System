@@ -79,7 +79,15 @@ public:
 
     // State of charge (SOC) from OCV
     float invertOCV_Discharge(float voltage);
-    
+
+    // SOC from OCV using the mean of the charge and discharge curves. Used for
+    // rest-state initialization where the true OCV sits between the two
+    // hysteresis branches.
+    float invertOCV_Average(float voltage);
+
+    // Override the EKF sample time after construction (s).
+    void setSampleTime(float dt_s) { Ts = dt_s; }
+
     // Configuration Setters
     void setParasiticResistance(float resistance_ohms) { parasitic_R = resistance_ohms; }
     void setMaxGainClamp(float max_pct_per_update) { max_gain_clamp = max_pct_per_update; }

@@ -551,3 +551,28 @@ float BatteryEKF::invertOCV_Discharge(float voltage) {
     // Fallback (shouldn't reach here)
     return 50.0f;
 }
+
+float BatteryEKF::invertOCV_Average(float voltage) {
+    // Average the charge and discharge OCV branches point-by-point, then invert
+    // the resulting mean curve. Both LUTs are monotonic in SOC.
+    auto avg = [](int soc) {
+        return 0.5f * (LUT_OCV_Discharge[soc] + LUT_OCV_Charge[soc]);
+    };
+
+    float v_min = avg(0);
+    float v_max = avg(100);
+
+    if (voltage <= v_min) return 0.0f;
+    if (voltage >= v_max) return 100.0f;
+
+    for (int soc = 0; soc < 100; soc++) {
+        float v_low = avg(soc);
+        float v_high = avg(soc + 1);
+        if (voltage >= v_low && voltage <= v_high) {
+            float frac = (voltage - v_low) / (v_high - v_low);
+            return (float)soc + frac;
+        }
+    }
+
+    return 50.0f;
+}

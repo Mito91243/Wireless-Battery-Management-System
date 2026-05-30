@@ -5,14 +5,10 @@
 #include <stddef.h>
 
 // ==================== NETWORK CONFIG ====================
-const char *const WIFI_SSID = "PE_Lab";
-const char *const WIFI_PASSWORD = "P0werM0$FET";
-
+// The master's home-WiFi credentials are NOT hardcoded — they are entered once
+// through the WiFiManager captive portal and saved in NVS (see reciever.cpp).
 const char *const MASTER_AP_SSID = "WBMS-Node"; // Soft AP the slave scans to discover the master's WiFi channel
-const int WIFI_RESET_PIN = 0;                    // BOOT button on ESP32 DevKit V1 — unused with hardcoded creds
-
-const uint32_t WIFI_TIMEOUT_MS = 15000;
-const uint32_t WIFI_RETRY_INTERVAL_MS = 10000;
+const uint32_t WIFI_RETRY_INTERVAL_MS = 10000;  // master background reconnect check cadence
 
 // ==================== MQTT CONFIG ====================
 const char *const MQTT_BROKER = "143.198.121.33";
@@ -22,15 +18,19 @@ const char *const MQTT_CLIENT_ID = "wbms-master";
 const char *const MQTT_USERNAME = "wbms-master";
 const char *const MQTT_PASSWORD = "mito1234";
 const uint32_t MQTT_RECONNECT_INTERVAL_MS = 5000;
+// Master subscribes to "<prefix><masterPairingCode>" for cloud->device commands (e.g. OTA).
+const char *const MQTT_CMD_TOPIC_PREFIX = "bms/cmd/";
 
-// ==================== HARDWARE CONFIG ====================
-// Mainboard PCB pinout (ESP32-S3): SDA=12, SCL=13. Same wiring as
-// mainboard_dashboard/tb_config.h so the slave sketch and dashboard sketch
-// are interchangeable on the same hardware.
-const int I2C_SDA_PIN = 12;
-const int I2C_SCL_PIN = 13;
+// ==================== OTA CONFIG (master only) ====================
+const char *const FW_VERSION = "0.1.0";   // bump on every released master image
+const float MIN_SOC_FOR_OTA = 30.0f;      // refuse OTA below this pack SoC
+// Bench escape hatch: uncomment to skip the SoC/fault/has-data prechecks so you
+// can OTA a master with no slave attached. MUST stay commented for any image
+// used with real cells.
+// #define OTA_SKIP_SAFETY_CHECKS
 
 // ==================== BMS CONFIG ====================
+// NOTE: the slave's I2C pins live in tb_config.h (MB_I2C_SDA/MB_I2C_SCL).
 // 13S3P pack: cells 1..12 wired to VC1..VC12, cell 13 wired to VC16
 // (VC13..VC15 are shorted to VC12). Parallel groups (3P) do not affect
 // per-cell voltage reads — only current/Ah scaling on the consumer side.
@@ -44,10 +44,10 @@ const uint8_t SENDER_ADDRESSES[][6] = {
 const int NUM_SENDERS = sizeof(SENDER_ADDRESSES) / sizeof(SENDER_ADDRESSES[0]);
 
 // ==================== SLAVE CONFIG ====================
-const int FALLBACK_CHANNEL = 1; // PE_Lab router channel — match master's actual WiFi channel
-const int FAILURE_THRESHOLD = 10; // Consecutive send failures before fallback AP starts
-const char *const FALLBACK_AP_SSID = "WBMS-Slave-Direct";
-const char *const FALLBACK_AP_PASS = "wbms1234";
+// The offline AP SSID is built at runtime as "wBMS-Slave-<pairingCode>" and
+// uses MB_AP_PASSWORD (tb_config.h); there is no fixed fallback SSID constant.
+const int FALLBACK_CHANNEL = 1;   // used only until the master's channel is learned
+const int FAILURE_THRESHOLD = 10; // consecutive ESP-NOW send failures before fallback AP starts
 const uint32_t SEND_INTERVAL_MS = 500;
 
 // ==================== MASTER CONFIG ====================
@@ -59,7 +59,7 @@ typedef struct
 {
   unsigned int v[16];
   unsigned int v_stack;
-  unsigned int v_ ack;
+  unsigned int v_pack;
   int current;
   float chip_temp;
   float temp1;
@@ -71,5 +71,29 @@ typedef struct
   bool isDischarging;
   char message[50];
 } __attribute__((packed)) DeviceMessage;
+
+// ==================== MASTER -> SLAVE HEARTBEAT ====================
+// Bidirectional ESP-NOW: the master beacons its TRUE uplink status to the
+// slave(s) so the slave can tell the difference between "master node gone"
+// and "master alive but cut off from the cloud" (issues A3). The slave uses
+// this both to decide when to fall back to its local AP and to recover.
+// MASTER_HB_MAGIC tags the frame so the slave's receive callback never
+// confuses a heartbeat with stray traffic.
+const uint8_t MASTER_HB_MAGIC = 0xB7; // arbitrary tag byte identifying a heartbeat frame
+
+typedef struct
+{
+  uint8_t magic;     // == MASTER_HB_MAGIC
+  uint8_t uplinkUp;  // 1 = master has WiFi + MQTT to the cloud, 0 = uplink down
+  uint8_t channel;   // master's current WiFi channel (so the slave can re-tune cheaply)
+  uint32_t seq;      // monotonically increasing, for debugging/loss tracking
+} __attribute__((packed)) MasterHeartbeat;
+
+// ==================== HEARTBEAT / FALLBACK TIMING (shared) ====================
+const uint32_t HEARTBEAT_INTERVAL_MS    = 1000;  // master beacons every 1 s
+const uint32_t HEARTBEAT_TIMEOUT_MS     = 5000;  // online: no heartbeat this long -> suspect master gone
+const uint32_t RECOVERY_HOP_INTERVAL_MS = 20000; // offline: how often to hop back and probe the master
+const uint32_t RECOVERY_LISTEN_MS       = 1200;  // offline: listen window per hop (kept < AP-client patience)
+const int      RECOVERY_GOOD_HOPS       = 2;     // consecutive good hops required before tearing down the AP (hysteresis)
 
 #endif
