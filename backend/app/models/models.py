@@ -23,6 +23,10 @@ class User(Base):
     email = Column(String(255), unique=True, nullable=False, index=True)
     password = Column(String(255), nullable=True)
     google_sub = Column(String(255), unique=True, nullable=True, index=True)
+    # Access level: "user" (default) | "developer" | "admin". Gates dev-only
+    # controls in the web UI. (The offline AP portal's dev-vs-user variant is a
+    # firmware-side flag — the ESP32 can't read this column when cloud is down.)
+    role = Column(String(20), nullable=False, default="user")
 
     packs = relationship("Pack", back_populates="owner")
     groups = relationship("PackGroup", back_populates="owner", cascade="all, delete-orphan")

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { Battery, BatteryCharging, Zap, AlertTriangle, Activity, History, Clock, TrendingDown, AlertCircle, Home, BarChart3, RefreshCw, Plus, X, Trash2, LogOut, Layers, Unlink, Repeat, Moon, Gauge } from 'lucide-react';
+import { Battery, BatteryCharging, Zap, AlertTriangle, Activity, History, Clock, TrendingDown, AlertCircle, Home, BarChart3, RefreshCw, Plus, X, Trash2, LogOut, Layers, Unlink, Repeat, Moon, Gauge, Download } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, ResponsiveContainer, Legend, Tooltip, CartesianGrid, AreaChart, Area } from 'recharts';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
@@ -1166,6 +1166,219 @@ const StatCard = ({ title, value, icon: Icon, color, subtitle }) => (
   </div>
 );
 
+// =============================================================================
+// Export Panel — pick a pack + time range, preview rows, download CSV.
+// Backed by GET /v1/packs/{id}/readings (json preview / csv stream). Times are
+// treated as UTC to match how the backend stores them.
+// =============================================================================
+const RANGE_PRESETS = [
+  { value: '1h', label: 'Last hour', ms: 3600e3 },
+  { value: '24h', label: 'Last 24 hours', ms: 86400e3 },
+  { value: '7d', label: 'Last 7 days', ms: 7 * 86400e3 },
+  { value: 'all', label: 'All time', ms: null },
+  { value: 'custom', label: 'Custom range', ms: undefined },
+];
+
+const ExportPanel = ({ packs }) => {
+  const [packId, setPackId] = useState(packs[0]?.id ?? '');
+  const [preset, setPreset] = useState('24h');
+  const [customStart, setCustomStart] = useState('');
+  const [customEnd, setCustomEnd] = useState('');
+  const [preview, setPreview] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [error, setError] = useState('');
+
+  // Default to the first pack once the list loads (state init misses late data).
+  useEffect(() => {
+    if (!packId && packs.length) setPackId(packs[0].id);
+  }, [packs, packId]);
+
+  const buildRange = () => {
+    if (preset === 'all') return {};
+    if (preset === 'custom') {
+      const r = {};
+      if (customStart) r.start = new Date(customStart).toISOString();
+      if (customEnd) r.end = new Date(customEnd).toISOString();
+      return r;
+    }
+    const p = RANGE_PRESETS.find((x) => x.value === preset);
+    return { start: new Date(Date.now() - p.ms).toISOString() };
+  };
+
+  const queryString = (extra) => new URLSearchParams({ ...buildRange(), ...extra }).toString();
+
+  const handlePreview = async () => {
+    if (!packId) { setError('Pick a pack first'); return; }
+    setLoading(true); setError(''); setPreview(null);
+    try {
+      const data = await apiFetch(`/v1/packs/${packId}/readings?${queryString({ format: 'json', limit: 100 })}`);
+      setPreview(data);
+    } catch (err) {
+      setError(err.message || 'Failed to load preview');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDownload = async () => {
+    if (!packId) { setError('Pick a pack first'); return; }
+    setDownloading(true); setError('');
+    try {
+      // Raw fetch (not apiFetch) so we can stream the CSV body as a blob.
+      const token = localStorage.getItem('wbms_token');
+      const res = await fetch(`/v1/packs/${packId}/readings?${queryString({ format: 'csv', limit: 100000 })}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) throw new Error(`Download failed (${res.status})`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const pack = packs.find((p) => p.id === Number(packId));
+      a.href = url;
+      a.download = `${pack?.pack_identifier || 'pack'}-readings.csv`;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(err.message || 'Download failed');
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  if (!packs.length) {
+    return (
+      <div className="text-center py-16 text-gray-500">
+        <Download className="h-10 w-10 text-gray-300 mx-auto mb-3" />
+        Add a pack first to export its data.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6 max-w-5xl">
+      <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6">
+        <h2 className="text-lg font-semibold text-gray-900 mb-1">Export pack data</h2>
+        <p className="text-sm text-gray-500 mb-5">
+          Pick a pack and a time range, preview the readings, then download them as CSV. Times are in UTC.
+        </p>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Pack</label>
+            <select
+              value={packId}
+              onChange={(e) => setPackId(Number(e.target.value))}
+              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
+            >
+              {packs.map((p) => (
+                <option key={p.id} value={p.id}>{p.name} · {p.pack_identifier}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Time range</label>
+            <select
+              value={preset}
+              onChange={(e) => setPreset(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
+            >
+              {RANGE_PRESETS.map((r) => (
+                <option key={r.value} value={r.value}>{r.label}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {preset === 'custom' && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Start (UTC)</label>
+              <input
+                type="datetime-local"
+                value={customStart}
+                onChange={(e) => setCustomStart(e.target.value)}
+                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">End (UTC)</label>
+              <input
+                type="datetime-local"
+                value={customEnd}
+                onChange={(e) => setCustomEnd(e.target.value)}
+                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+          </div>
+        )}
+
+        {error && (
+          <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-md text-sm text-red-600">{error}</div>
+        )}
+
+        <div className="flex flex-wrap gap-3 mt-5">
+          <button
+            onClick={handlePreview}
+            disabled={loading}
+            className={`px-4 py-2 rounded-md text-sm font-medium border transition ${
+              loading ? 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed' : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+            }`}
+          >
+            {loading ? 'Loading…' : 'Preview'}
+          </button>
+          <button
+            onClick={handleDownload}
+            disabled={downloading}
+            className={`flex items-center gap-2 px-4 py-2 rounded-md text-sm font-medium text-white transition ${
+              downloading ? 'bg-blue-300 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'
+            }`}
+          >
+            <Download className="h-4 w-4" />
+            {downloading ? 'Preparing…' : 'Download CSV'}
+          </button>
+        </div>
+      </div>
+
+      {preview && (
+        <div className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">
+          <div className="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
+            <h3 className="text-sm font-semibold text-gray-900">
+              Preview <span className="text-gray-400 font-normal">— {preview.count} row{preview.count === 1 ? '' : 's'} (newest 100)</span>
+            </h3>
+          </div>
+          {preview.count === 0 ? (
+            <div className="px-6 py-12 text-center text-gray-400 text-sm">No readings in this range.</div>
+          ) : (
+            <div className="overflow-x-auto max-h-[28rem]">
+              <table className="w-full text-sm">
+                <thead className="sticky top-0 bg-gray-50">
+                  <tr>
+                    {preview.columns.map((c) => (
+                      <th key={c} className="text-left py-2.5 px-3 font-medium text-gray-600 whitespace-nowrap">{c}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {preview.rows.map((row, i) => (
+                    <tr key={i} className="border-t border-gray-100 hover:bg-gray-50">
+                      {row.map((cell, j) => (
+                        <td key={j} className="py-2 px-3 text-gray-700 whitespace-nowrap tabular-nums">
+                          {cell === null ? '—' : String(cell)}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
 // Main Dashboard Component
 const Dashboard = () => {
   const { user, logout } = useAuth();
@@ -1195,6 +1408,8 @@ const Dashboard = () => {
   // Add this ref to track last update time
   const lastUpdateTime = useRef(null);
   const lastRangeUpdate = useRef(null);
+  // Guards the one-time seed of SOC history from the DB (see effect below).
+  const seededHistory = useRef(false);
 
   const handleLogout = () => {
     logout();
@@ -1377,6 +1592,67 @@ const Dashboard = () => {
   useEffect(() => {
     fetchUserPacks();
   }, [fetchUserPacks, refreshKey]);
+
+  // Seed SOC history from real DB readings once packs are known, so Charge
+  // Stats and Pack Activity have real history immediately instead of slowly
+  // re-accumulating from live polls (which reset on every refresh and left
+  // Pack Activity stuck on "Collecting data"). Live polls append after this.
+  useEffect(() => {
+    if (seededHistory.current || userPacks.length === 0) return;
+    seededHistory.current = true;
+
+    const fmt = (iso) =>
+      new Date(iso).toLocaleTimeString('en-US', {
+        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true,
+      });
+
+    (async () => {
+      const since = new Date(Date.now() - 24 * 3600e3).toISOString();
+      const results = await Promise.all(
+        userPacks.map((p) =>
+          apiFetch(`/v1/packs/${p.id}/readings?start=${since}&limit=500`)
+            .then((d) => ({ p, rows: d.rows || [] }))
+            .catch(() => null)
+        )
+      );
+
+      // Per-pack series, keyed by identifier to match the live-poll path.
+      const nextPack = {};
+      // Aggregate points carry an epoch (t) for correct cross-pack sorting.
+      const aggPoints = [];
+      results.filter(Boolean).forEach(({ p, rows }) => {
+        const series = rows
+          .filter((r) => r[1] != null)        // r = [timestamp, soc, ...]
+          .map((r) => ({ time: fmt(r[0]), percentage: Number(r[1]) }));
+        if (series.length) nextPack[p.pack_identifier] = series;
+        rows.forEach((r) => {
+          if (r[1] != null) aggPoints.push({ t: new Date(r[0]).getTime(), soc: Number(r[1]) });
+        });
+      });
+
+      if (Object.keys(nextPack).length) {
+        setPackRangeData((prev) => ({ ...nextPack, ...prev }));
+      }
+
+      // Aggregate: average SOC of readings sharing the same second, ordered by time.
+      if (aggPoints.length) {
+        const buckets = new Map();
+        aggPoints.forEach(({ t, soc }) => {
+          const key = Math.round(t / 1000);
+          const b = buckets.get(key) || { sum: 0, n: 0 };
+          b.sum += soc; b.n += 1; buckets.set(key, b);
+        });
+        const agg = [...buckets.entries()]
+          .sort((a, b) => a[0] - b[0])
+          .map(([sec, { sum, n }]) => ({
+            time: fmt(sec * 1000),
+            percentage: Number((sum / n).toFixed(1)),
+          }))
+          .slice(-200);
+        setRangeData((prev) => (prev.length ? prev : agg));
+      }
+    })();
+  }, [userPacks]);
 
   // Fetch data on mount and set up polling
   useEffect(() => {
@@ -1706,7 +1982,8 @@ const Dashboard = () => {
   const navItems = [
     { value: 'summary', label: 'Summary & Stats', icon: Home },
     { value: 'charts', label: 'Charts', icon: BarChart3 },
-    { value: 'history', label: 'History', icon: History },
+    { value: 'alerts', label: 'Alerts', icon: AlertCircle },
+    { value: 'export', label: 'Export', icon: Download },
   ];
 
   return (
@@ -1939,7 +2216,9 @@ const Dashboard = () => {
             </div>
           )}
 
-          {activeTab === 'history' && AlarmHistory({ alarms, onClear: () => setAlarms([]) })}
+          {activeTab === 'alerts' && AlarmHistory({ alarms, onClear: () => setAlarms([]) })}
+
+          {activeTab === 'export' && <ExportPanel packs={userPacks} />}
 
           {activeTab === 'pack' && (() => {
             const pack = batteryPacks.find(p => p.id === selectedPackId);

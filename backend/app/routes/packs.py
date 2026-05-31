@@ -1,7 +1,11 @@
+import csv
+import io
 import random
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -243,6 +247,108 @@ def get_latest_pack_data(
         "status": "success",
         "timestamp": datetime.now().replace(microsecond=0).isoformat(),
         "packs": battery_packs,
+    }
+
+
+# Columns shared by the JSON preview and the CSV export so the on-screen table
+# and the downloaded file always match exactly.
+_EXPORT_COLUMNS = [
+    "timestamp", "soc", "soh", "voltage_v", "current_a",
+    "temperature_c", "temp1_c", "temp2_c", "temp3_c", "power_w", "state",
+]
+
+
+def _parse_iso(value: Optional[str], field: str) -> Optional[datetime]:
+    """Parse an ISO-8601 string to a naive UTC datetime (timestamps are stored
+    tz-naive UTC). Tolerates a trailing 'Z'. Returns None for empty input."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid {field} (use ISO-8601)")
+    # Timestamps are stored UTC-naive; normalize tz-aware input to UTC-naive so
+    # the comparison is correct regardless of the server's local timezone. A
+    # naive input is taken to already be UTC.
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def _round(value, ndigits):
+    return None if value is None else round(value, ndigits)
+
+
+def _reading_row(r: Reading) -> list:
+    """One reading as a list aligned to _EXPORT_COLUMNS. None for missing values
+    (JSON serializes as null; the CSV writer maps them to empty cells)."""
+    if r.charging_discharging is None:
+        state = "idle"
+    else:
+        state = "charging" if r.charging_discharging else "discharging"
+    return [
+        r.timestamp.replace(microsecond=0).isoformat(),
+        _round(r.soc, 2), _round(r.soh, 2),
+        _round(r.v_real, 3), _round(r.current, 3),
+        _round(r.temperature, 2), _round(r.temp1, 2), _round(r.temp2, 2), _round(r.temp3, 2),
+        _round(r.power, 2), state,
+    ]
+
+
+@router.get("/{pack_id}/readings")
+def get_pack_readings(
+    pack_id: int,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=100_000),
+    format: str = Query("json", pattern="^(json|csv)$"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Historical readings for one owned pack over an optional time range.
+
+    `format=json` returns the most recent `limit` rows (chronological) for an
+    on-screen preview; `format=csv` streams the range as a downloadable file.
+    Rows are arrays aligned to the `columns` list so preview and CSV match.
+    """
+    pack = db.query(Pack).filter(
+        Pack.id == pack_id, Pack.user_id == current_user.id
+    ).first()
+    if not pack:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pack not found")
+
+    start_dt = _parse_iso(start, "start")
+    end_dt = _parse_iso(end, "end")
+
+    q = db.query(Reading).filter(Reading.pack_id == pack.id)
+    if start_dt is not None:
+        q = q.filter(Reading.timestamp >= start_dt)
+    if end_dt is not None:
+        q = q.filter(Reading.timestamp <= end_dt)
+
+    if format == "csv":
+        rows = q.order_by(Reading.timestamp.asc()).limit(limit).all()
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(_EXPORT_COLUMNS)
+        for r in rows:
+            writer.writerow(["" if v is None else v for v in _reading_row(r)])
+        buf.seek(0)
+        filename = f"{pack.pack_identifier}-readings.csv"
+        return StreamingResponse(
+            iter([buf.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    # JSON preview: newest `limit` rows, returned oldest→newest for display.
+    rows = q.order_by(Reading.timestamp.desc()).limit(limit).all()
+    rows.reverse()
+    return {
+        "pack": {"id": pack.id, "identifier": pack.pack_identifier, "name": pack.name},
+        "columns": _EXPORT_COLUMNS,
+        "count": len(rows),
+        "rows": [_reading_row(r) for r in rows],
     }
 
 
