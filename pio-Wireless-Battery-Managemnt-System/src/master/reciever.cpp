@@ -449,10 +449,252 @@ void handleOtaCommand(const char *json)
   performOta(url, version, sha256);
 }
 
+// ==================== SLAVE PAIRING CACHE + ADMIN COMMAND BRIDGE ====================
+const char *const MQTT_SNAPSHOT_TOPIC = "bms/snapshot";
+
+// Maps a slave's pairing code -> its MAC, learned for free from telemetry
+// (OnDataRecv sees both the source MAC and the code in DeviceMessage.message).
+typedef struct { char code[7]; uint8_t mac[6]; bool used; } PairEntry;
+PairEntry pairCache[NUM_SENDERS + 4];
+portMUX_TYPE pairMux = portMUX_INITIALIZER_UNLOCKED;
+
+void cachePairing(const char *code, const uint8_t *mac)
+{
+  if (!code || !code[0]) return;
+  portENTER_CRITICAL(&pairMux);
+  int freeSlot = -1;
+  for (int i = 0; i < (int)(sizeof(pairCache) / sizeof(pairCache[0])); i++)
+  {
+    if (pairCache[i].used && strcmp(pairCache[i].code, code) == 0)
+    {
+      memcpy(pairCache[i].mac, mac, 6);
+      portEXIT_CRITICAL(&pairMux);
+      return;
+    }
+    if (!pairCache[i].used && freeSlot < 0) freeSlot = i;
+  }
+  if (freeSlot >= 0)
+  {
+    strncpy(pairCache[freeSlot].code, code, 6);
+    pairCache[freeSlot].code[6] = '\0';
+    memcpy(pairCache[freeSlot].mac, mac, 6);
+    pairCache[freeSlot].used = true;
+  }
+  portEXIT_CRITICAL(&pairMux);
+}
+
+bool lookupSlaveMac(const char *code, uint8_t *macOut)
+{
+  bool found = false;
+  portENTER_CRITICAL(&pairMux);
+  for (int i = 0; i < (int)(sizeof(pairCache) / sizeof(pairCache[0])); i++)
+  {
+    if (pairCache[i].used && strcmp(pairCache[i].code, code) == 0)
+    {
+      memcpy(macOut, pairCache[i].mac, 6);
+      found = true;
+      break;
+    }
+  }
+  portEXIT_CRITICAL(&pairMux);
+  return found;
+}
+
+// Single-slot snapshot hand-off: OnDataRecv (WiFi task) -> loop() publishes to MQTT.
+AdminSnapshot g_snap;
+volatile bool g_hasSnap = false;
+portMUX_TYPE  snapMux = portMUX_INITIALIZER_UNLOCKED;
+
+void enqueueSnapshot(const AdminSnapshot &s)
+{
+  portENTER_CRITICAL(&snapMux);
+  memcpy(&g_snap, &s, sizeof(g_snap));
+  g_hasSnap = true;
+  portEXIT_CRITICAL(&snapMux);
+}
+bool dequeueSnapshot(AdminSnapshot &out)
+{
+  bool has = false;
+  portENTER_CRITICAL(&snapMux);
+  if (g_hasSnap) { memcpy(&out, &g_snap, sizeof(out)); g_hasSnap = false; has = true; }
+  portEXIT_CRITICAL(&snapMux);
+  return has;
+}
+
+// Extract an integer JSON value ("key": 123). Complements extractJsonString.
+bool extractJsonLong(const char *json, const char *key, long *out)
+{
+  char needle[40];
+  int n = snprintf(needle, sizeof(needle), "\"%s\"", key);
+  if (n <= 0 || n >= (int)sizeof(needle)) return false;
+  const char *p = strstr(json, needle);
+  if (!p) return false;
+  p += n;
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p != ':') return false;
+  p++;
+  while (*p == ' ' || *p == '\t') p++;
+  char *endp = nullptr;
+  long v = strtol(p, &endp, 10);
+  if (endp == p) return false;
+  *out = v;
+  return true;
+}
+
+// Map a cloud action string to the ESP-NOW op code (mirror of the slave's opToAction).
+uint8_t actionToOp(const char *a)
+{
+  if (!strcmp(a, "chgOn")) return OP_CHG_ON;
+  if (!strcmp(a, "chgOff")) return OP_CHG_OFF;
+  if (!strcmp(a, "dsgOn")) return OP_DSG_ON;
+  if (!strcmp(a, "dsgOff")) return OP_DSG_OFF;
+  if (!strcmp(a, "allFetsOn")) return OP_ALL_FETS_ON;
+  if (!strcmp(a, "allFetsOff")) return OP_ALL_FETS_OFF;
+  if (!strcmp(a, "chgTog")) return OP_CHG_TOG;
+  if (!strcmp(a, "dsgTog")) return OP_DSG_TOG;
+  if (!strcmp(a, "pchgTog")) return OP_PCHG_TOG;
+  if (!strcmp(a, "pdsgTog")) return OP_PDSG_TOG;
+  if (!strcmp(a, "fetMasterToggle")) return OP_FET_MASTER_TOGGLE;
+  if (!strcmp(a, "clearFaults")) return OP_CLEAR_FAULTS;
+  if (!strcmp(a, "pfReset")) return OP_PF_RESET;
+  if (!strcmp(a, "reset")) return OP_RESET;
+  if (!strcmp(a, "resetCharge")) return OP_RESET_CHARGE;
+  if (!strcmp(a, "toggleBal")) return OP_TOGGLE_BAL;
+  if (!strcmp(a, "toggleBalMaster")) return OP_TOGGLE_BAL_MASTER;
+  if (!strcmp(a, "toggleAutoSleep")) return OP_TOGGLE_AUTO_SLEEP;
+  if (!strcmp(a, "pwrDeep")) return OP_PWR_DEEP;
+  if (!strcmp(a, "pwrWake")) return OP_PWR_WAKE;
+  if (!strcmp(a, "setHostBalParams")) return OP_SET_HOST_BAL;
+  if (!strcmp(a, "ekfReset")) return OP_EKF_RESET;
+  if (!strcmp(a, "setProtection")) return OP_CONFIG_WRITE;
+  return OP_NONE;
+}
+
+// Serialize a received snapshot to MQTT JSON (field names mirror the slave /api/data
+// so the cloud admin view reuses the same contract). Published to bms/snapshot.
+String buildSnapshotJson(const AdminSnapshot &s)
+{
+  char pcode[7];
+  snprintf(pcode, sizeof(pcode), "%02X%02X%02X", s.pcode[0], s.pcode[1], s.pcode[2]);
+  String j; j.reserve(1500);
+  j += "{\"pairingCode\":\"" + String(pcode) + "\"";
+  j += ",\"reqSeq\":" + String(s.reqSeq);
+  j += ",\"v\":[";
+  for (int i = 0; i < 16; i++) { j += String(s.v[i]); if (i < 15) j += ","; }
+  j += "]";
+  j += ",\"vStack\":" + String(s.vStack) + ",\"vPack\":" + String(s.vPack);
+  j += ",\"current\":" + String(s.current);
+  j += ",\"charge\":" + String(s.charge, 1) + ",\"chargeTime\":" + String(s.chargeTime);
+  j += ",\"chipTemp\":" + String(s.chipTemp, 1);
+  j += ",\"temp1\":" + String(s.temp1, 1) + ",\"temp2\":" + String(s.temp2, 1) + ",\"temp3\":" + String(s.temp3, 1);
+  j += ",\"soc_ekf\":" + String(s.soc_ekf, 1) + ",\"cc_soc\":" + String(s.cc_soc, 1) + ",\"soh\":" + String(s.soh, 1);
+  j += ",\"soc_uncertainty\":" + String(s.soc_uncertainty, 2) + ",\"vErr\":" + String(s.vErr, 1);
+  j += ",\"vrc1\":" + String(s.vrc1, 4) + ",\"vrc2\":" + String(s.vrc2, 4) + ",\"vrc3\":" + String(s.vrc3, 4);
+  j += ",\"timeRemain\":" + String(s.timeRemain, 2);
+  j += ",\"saA\":" + String(s.saA) + ",\"saB\":" + String(s.saB) + ",\"saC\":" + String(s.saC);
+  j += ",\"ssA\":" + String(s.ssA) + ",\"ssB\":" + String(s.ssB) + ",\"ssC\":" + String(s.ssC);
+  j += ",\"pfA\":" + String(s.pfA) + ",\"pfB\":" + String(s.pfB) + ",\"pfC\":" + String(s.pfC) + ",\"pfD\":" + String(s.pfD);
+  j += ",\"batStat\":" + String(s.batStat) + ",\"manStat\":" + String(s.manStat);
+  j += ",\"bal\":" + String(s.balMask) + ",\"balMode\":" + String(s.balMode);
+  j += ",\"balSuspended\":" + String(s.balSuspended) + ",\"hwBalActive\":" + String(s.hwBalActive);
+  j += ",\"balTrig\":" + String(s.balTrig) + ",\"balDelta\":" + String(s.balDelta);
+  j += ",\"balTime\":" + String(s.totalBalTime) + ",\"cellDelta\":" + String(s.cellDelta);
+  j += ",\"minV\":" + String(s.minV) + ",\"maxV\":" + String(s.maxV);
+  j += ",\"cellBalTimes\":[";
+  for (int i = 0; i < 16; i++) { j += String(s.cellBalTimes[i]); if (i < 15) j += ","; }
+  j += "]";
+  j += ",\"pwr\":" + String(s.pwr) + ",\"pendingPwr\":" + String(s.pendingPwr);
+  j += ",\"isCharging\":" + String(s.isCharging) + ",\"isDischarging\":" + String(s.isDischarging);
+  j += ",\"autoSleep\":" + String(s.autoSleep) + ",\"fetEn\":" + String(s.fetEn);
+  j += ",\"balMaster\":" + String(s.balMaster) + ",\"wdFault\":" + String(s.wdFault) + ",\"ledState\":" + String(s.ledState);
+  j += ",\"protBits\":" + String(s.protBits) + ",\"tempBits\":" + String(s.tempBits) + ",\"fetBits\":" + String(s.fetBits);
+  j += ",\"cfg_cb\":" + String(s.cfg_cb) + ",\"cfg_protA\":" + String(s.cfg_protA) + ",\"cfg_protB\":" + String(s.cfg_protB);
+  j += ",\"lastCmdRc\":" + String(s.lastCmdRc);
+  j += "}";
+  return j;
+}
+
+// Parse an admin command from MQTT and forward it to the target slave over ESP-NOW.
+void handleSlaveCommand(const char *json)
+{
+  char op[16] = {0};
+  if (!extractJsonString(json, "op", op, sizeof(op))) return;
+
+  SlaveCommand c; memset(&c, 0, sizeof(c));
+  c.magic = SLAVE_CMD_MAGIC;
+  long seq = 0; extractJsonLong(json, "seq", &seq); c.seq = (uint16_t)seq;
+  char target[8] = {0};
+  if (!extractJsonString(json, "target", target, sizeof(target)))
+  {
+    Serial.println("[CMD] missing target pairing code");
+    return;
+  }
+
+  if (strcmp(op, "snapshot") == 0)
+  {
+    c.op = OP_SNAPSHOT_REQ;
+  }
+  else if (strcmp(op, "slavecmd") == 0)
+  {
+    char action[24] = {0};
+    if (!extractJsonString(json, "action", action, sizeof(action))) return;
+    c.op = actionToOp(action);
+    if (c.op == OP_NONE) { Serial.printf("[CMD] unknown action %s\n", action); return; }
+    if (c.op == OP_CONFIG_WRITE)
+    {
+      long v;
+      if (extractJsonLong(json, "cuv", &v)) c.cuv = (uint16_t)v;
+      if (extractJsonLong(json, "cuv_d", &v)) c.cuv_d = (uint16_t)v;
+      if (extractJsonLong(json, "cov", &v)) c.cov = (uint16_t)v;
+      if (extractJsonLong(json, "cov_d", &v)) c.cov_d = (uint16_t)v;
+      if (extractJsonLong(json, "occ", &v)) c.occ = (uint16_t)v;
+      if (extractJsonLong(json, "occ_d", &v)) c.occ_d = (uint16_t)v;
+      if (extractJsonLong(json, "ocd1", &v)) c.ocd1 = (uint16_t)v;
+      if (extractJsonLong(json, "ocd1_d", &v)) c.ocd1_d = (uint16_t)v;
+      if (extractJsonLong(json, "ocd2", &v)) c.ocd2 = (uint16_t)v;
+      if (extractJsonLong(json, "ocd2_d", &v)) c.ocd2_d = (uint16_t)v;
+      if (extractJsonLong(json, "scd", &v)) c.scd = (uint8_t)v;
+      if (extractJsonLong(json, "scd_d", &v)) c.scd_d = (uint8_t)v;
+    }
+    else if (c.op == OP_SET_HOST_BAL)
+    {
+      long t = 0, d = 0;
+      extractJsonLong(json, "trigger", &t);
+      extractJsonLong(json, "delta", &d);
+      c.arg_u16[0] = (uint16_t)t; c.arg_u16[1] = (uint16_t)d;
+    }
+  }
+  else
+  {
+    return;
+  }
+
+  uint8_t mac[6];
+  if (!lookupSlaveMac(target, mac))
+  {
+    Serial.printf("[CMD] no MAC cached for target %s (slave not seen yet)\n", target);
+    return;
+  }
+  if (!esp_now_is_peer_exist(mac))
+  {
+    esp_now_peer_info_t p = {};
+    memcpy(p.peer_addr, mac, 6);
+    p.channel = currentChannel;
+    p.encrypt = false;
+    esp_now_add_peer(&p);
+  }
+  for (int i = 0; i < 3; i++)   // best-effort: send 3x; the real ack is the seq echo in telemetry
+  {
+    esp_now_send(mac, (uint8_t *)&c, sizeof(c));
+    delay(40);
+  }
+  Serial.printf("[CMD] op=%d seq=%u -> %s (x3)\n", c.op, c.seq, target);
+}
+
 // MQTT subscribe callback: dispatch commands arriving on our command topic.
 void mqttCallback(char *topic, byte *payload, unsigned int length)
 {
-  char buf[512];
+  char buf[640];
   if (length >= sizeof(buf))
   {
     Serial.printf("[MQTT] Command on %s too large (%u bytes), dropping\n", topic, length);
@@ -461,8 +703,17 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
   memcpy(buf, payload, length);
   buf[length] = '\0';
   Serial.printf("[MQTT] 📨 Command on %s: %s\n", topic, buf);
-  if (strcmp(topic, mqttCmdTopic) == 0)
+  if (strcmp(topic, mqttCmdTopic) != 0)
+    return;
+
+  // Dispatch by op: OTA stays on its existing path; everything else is an admin
+  // command/snapshot request bridged to the target slave over ESP-NOW.
+  char op[16] = {0};
+  extractJsonString(buf, "op", op, sizeof(op));
+  if (strcmp(op, "ota") == 0)
     handleOtaCommand(buf);
+  else
+    handleSlaveCommand(buf);
 }
 
 void updateESPNowChannel(uint8_t newChannel)
@@ -576,6 +827,8 @@ String buildJsonPayload(int senderIndex, const DeviceMessage &data, float soc)
   json += "\"ssA\":" + String(data.ss_a) + ",";
   json += "\"ssB\":" + String(data.ss_b) + ",";
   json += "\"ssC\":" + String(data.ss_c) + ",";
+  json += "\"lastCmdSeq\":" + String(data.lastCmdSeq) + ",";  // admin-command ack
+  json += "\"lastCmdRc\":" + String(data.lastCmdRc) + ",";
   json += "\"soc\":" + String(soc, 1) + ",";
   json += "\"message\":\"" + msg + "\"";
   json += "}";
@@ -614,6 +867,15 @@ int findSenderIndex(const uint8_t *macAddr)
 
 void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len)
 {
+  // Admin snapshot (slave -> master, on demand): hand to loop() to publish.
+  if (len == (int)sizeof(AdminSnapshot) && incomingData[0] == ADMIN_SNAPSHOT_MAGIC)
+  {
+    AdminSnapshot s;
+    memcpy(&s, incomingData, sizeof(s));
+    enqueueSnapshot(s);
+    return;
+  }
+
   if (len != sizeof(DeviceMessage))
   {
     Serial.printf("[ESP-NOW] ❌ Size mismatch: %d bytes\n", len);
@@ -623,6 +885,15 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len)
   DeviceMessage tempData;
   memcpy(&tempData, incomingData, sizeof(tempData));
   tempData.message[sizeof(tempData.message) - 1] = '\0';
+
+  // Learn pairingCode -> MAC for admin command routing (message is "BMS:<6hex>").
+  if (strncmp(tempData.message, "BMS:", 4) == 0)
+  {
+    char code[7];
+    strncpy(code, tempData.message + 4, 6);
+    code[6] = '\0';
+    cachePairing(code, mac_addr);
+  }
 
   int senderIndex = findSenderIndex(mac_addr);
   String senderMac = macToString(mac_addr);
@@ -682,7 +953,7 @@ void setup()
 
   // ── MQTT setup ──
   mqtt.setServer(MQTT_BROKER, MQTT_PORT);
-  mqtt.setBufferSize(1024);  // headroom for 16-cell payloads + soh/ssA/ssB/ssC + long status
+  mqtt.setBufferSize(2048);  // headroom for 16-cell telemetry + the full admin snapshot JSON
   mqtt.setCallback(mqttCallback);
   connectMqtt();
 
@@ -758,6 +1029,18 @@ void loop()
       senderState[idx].hasData = true;
 
       publishToMqtt(idx, qMsg.data, soc);
+    }
+  }
+
+  // Publish any admin snapshot the slave returned (built on the WiFi task, sent here).
+  AdminSnapshot snap;
+  if (dequeueSnapshot(snap))
+  {
+    if (mqtt.connected())
+    {
+      String sj = buildSnapshotJson(snap);
+      bool ok = mqtt.publish(MQTT_SNAPSHOT_TOPIC, sj.c_str());
+      Serial.printf("[Snapshot] publish %s (%d bytes) %s\n", MQTT_SNAPSHOT_TOPIC, sj.length(), ok ? "ok" : "FAIL");
     }
   }
   delay(10);

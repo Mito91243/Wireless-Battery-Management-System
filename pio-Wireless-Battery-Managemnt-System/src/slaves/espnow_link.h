@@ -73,6 +73,16 @@ int failedHops = 0;   // consecutive failed recovery hops on the cached channel;
                       // triggers an SSID rescan so a master channel change can't
                       // strand us forever (see doRecoveryHop).
 
+// ==================== ADMIN COMMAND STATE ====================
+// Admin commands arrive on the WiFi-task recv callback but execute heavy BQ76952
+// I2C (which the main loop also drives). The callback only ENQUEUES; the command
+// runs in processPendingCommand() on the main loop task — never touch I2C from the
+// callback or it races the loop's reads.
+SlaveCommand  g_pendingCmd;
+volatile bool g_hasPendingCmd = false;
+portMUX_TYPE  g_cmdMux = portMUX_INITIALIZER_UNLOCKED;
+uint8_t       g_slaveMacTail[3] = {0, 0, 0};  // last 3 MAC bytes, stamped into snapshots
+
 // ==================== CHANNEL SCAN ====================
 // Locate the master's discovery AP (MASTER_AP_SSID) and return its channel, or
 // -1 if the master AP isn't currently visible. The caller decides whether to
@@ -109,15 +119,28 @@ void espnowOnSent(const uint8_t *mac, esp_now_send_status_t status) {
 // Master -> slave heartbeat. Carries the master's REAL uplink status, so the
 // slave can detect "cloud down" even when the master node still ACKs (A3).
 void espnowOnRecv(const uint8_t *mac, const uint8_t *data, int len) {
-  if (len != (int)sizeof(MasterHeartbeat)) return;
-  MasterHeartbeat hb;
-  memcpy(&hb, data, sizeof(hb));
-  if (hb.magic != MASTER_HB_MAGIC) return;
+  // ---- Master heartbeat (cloud-status beacon) ----
+  if (len == (int)sizeof(MasterHeartbeat) && data[0] == MASTER_HB_MAGIC) {
+    MasterHeartbeat hb;
+    memcpy(&hb, data, sizeof(hb));
+    lastHeartbeatMs = millis();
+    lastUplinkUp = (hb.uplinkUp != 0);
+    masterChannel = hb.channel;     // master tells us its channel -> cheap re-tune, no rescan
+    heartbeatEverSeen = true;
+    return;
+  }
 
-  lastHeartbeatMs = millis();
-  lastUplinkUp = (hb.uplinkUp != 0);
-  masterChannel = hb.channel;       // master tells us its channel -> cheap re-tune, no rescan
-  heartbeatEverSeen = true;
+  // ---- Admin command (cloud -> master -> here). Enqueue only; the main loop
+  //      executes it (I2C must not run on the WiFi task). Only accept while
+  //      ONLINE — offline we are on our own AP channel, not the master's. ----
+  if (len == (int)sizeof(SlaveCommand) && data[0] == SLAVE_CMD_MAGIC) {
+    if (linkMode != LINK_ONLINE) return;
+    portENTER_CRITICAL_ISR(&g_cmdMux);
+    memcpy(&g_pendingCmd, data, sizeof(SlaveCommand));
+    g_hasPendingCmd = true;
+    portEXIT_CRITICAL_ISR(&g_cmdMux);
+    return;
+  }
 }
 
 // ==================== PEER MANAGEMENT ====================
@@ -151,6 +174,8 @@ void packDeviceMessage() {
   espnowOut.ss_a = (uint8_t)ssA_val;      // latched BQ protection faults -> cloud alerts
   espnowOut.ss_b = (uint8_t)ssB_val;
   espnowOut.ss_c = (uint8_t)ssC_val;
+  espnowOut.lastCmdSeq = g_lastCmdSeq;    // ack: echo the last applied admin command
+  espnowOut.lastCmdRc  = g_lastCmdRc;
   snprintf(espnowOut.message, sizeof(espnowOut.message), "BMS:%s", pairingCode);
 }
 
@@ -197,6 +222,7 @@ void espnowSetup() {
   uint8_t mac[6];
   WiFi.macAddress(mac);
   snprintf(pairingCode, sizeof(pairingCode), "%02X%02X%02X", mac[3], mac[4], mac[5]);
+  g_slaveMacTail[0] = mac[3]; g_slaveMacTail[1] = mac[4]; g_slaveMacTail[2] = mac[5];
   snprintf(slaveApSsid, sizeof(slaveApSsid), "wBMS-Slave-%s", pairingCode); // unique per unit (issues C2)
   Serial.printf("[LINK] MAC %s  Pairing %s\n", WiFi.macAddress().c_str(), pairingCode);
 
@@ -325,8 +351,53 @@ void serviceOffline() {
   }
 }
 
+// ==================== ADMIN COMMAND EXECUTOR (main loop task) ====================
+// Pops one enqueued admin command and runs it where it's safe to drive I2C. The
+// snapshot reply is also sent here (reads cached globals, no torn-read worries).
+void processPendingCommand() {
+  bool has = false;
+  SlaveCommand c;
+  portENTER_CRITICAL(&g_cmdMux);
+  has = g_hasPendingCmd;
+  if (has) { memcpy(&c, &g_pendingCmd, sizeof(c)); g_hasPendingCmd = false; }
+  portEXIT_CRITICAL(&g_cmdMux);
+  if (!has) return;
+
+  CmdRc rc;
+  if (c.op == OP_SNAPSHOT_REQ) {
+    AdminSnapshot s;
+    packAdminSnapshot(&s, c.seq);
+    s.pcode[0] = g_slaveMacTail[0]; s.pcode[1] = g_slaveMacTail[1]; s.pcode[2] = g_slaveMacTail[2];
+    esp_now_send(RECEIVER_ADDRESS, (uint8_t *)&s, sizeof(s));
+    rc = RC_OK;
+  } else if (c.op == OP_CONFIG_WRITE) {
+    applyConfigWrite(c.cuv, c.cuv_d, c.cov, c.cov_d, c.occ, c.occ_d,
+                     c.ocd1, c.ocd1_d, c.ocd2, c.ocd2_d, c.scd, c.scd_d);
+    rc = RC_OK_REBOOT;   // new thresholds applied on the next boot (re-runs initBQ76952)
+  } else if (c.op == OP_EKF_RESET) {
+    runEkfReset();
+    rc = RC_OK;
+  } else {
+    char msg[8];
+    rc = runDeviceCommand(opToAction(c.op), c.arg_u16[0], c.arg_u16[1], msg, sizeof(msg));
+  }
+
+  g_lastCmdRc = rc;
+  g_lastCmdSeq = c.seq;   // ack only AFTER applying, so the cloud doesn't mark it early
+  if (rc == RC_OK_REBOOT) { g_pendingReboot = true; g_rebootArmedMs = millis(); }
+  Serial.printf("[CMD] op=%d seq=%u rc=%d\n", c.op, c.seq, rc);
+}
+
 // ==================== LOOP ENTRY ====================
 void espnowLoop() {
+  processPendingCommand();
+  // Deferred reboot (config-write / reset over ESP-NOW): wait so at least one
+  // telemetry frame carrying the ack ships before we restart.
+  if (g_pendingReboot && millis() - g_rebootArmedMs > 600) {
+    Serial.println("[CMD] deferred reboot");
+    delay(50);
+    ESP.restart();
+  }
   if (linkMode == LINK_ONLINE)
     serviceOnline();
   else

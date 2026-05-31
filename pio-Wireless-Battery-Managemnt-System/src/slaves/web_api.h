@@ -1269,6 +1269,358 @@ void handleApiLog() {
 
 
 
+// ==================================================================
+// Shared command dispatcher — transport-agnostic core used by BOTH the
+// local AP HTTP handlers and the cloud admin console (ESP-NOW). No server.*
+// calls live here so it is safe to call from the ESP-NOW receive callback.
+// ==================================================================
+
+// Echoed back to the cloud in DeviceMessage (set by the ESP-NOW command path).
+volatile uint16_t      g_lastCmdSeq    = 0;
+volatile uint8_t       g_lastCmdRc     = RC_OK;
+volatile bool          g_pendingReboot = false;  // reboot-class cmd over ESP-NOW; loop() reboots
+volatile unsigned long g_rebootArmedMs = 0;
+
+// Run one device command. action = the same strings handleApiCmd used; arg0/arg1
+// carry setHostBalParams trigger/delta. Writes an optional human message to msgOut.
+CmdRc runDeviceCommand(const char *action, uint16_t arg0, uint16_t arg1,
+                       char *msgOut, size_t msgLen) {
+  extern Preferences prefs;
+  if (msgOut && msgLen) msgOut[0] = '\0';
+
+  if (strcmp(action, "chgOn") == 0) {
+    Serial.println("=== CHG ON REQUEST ===");
+    bms.CommandOnlysubCommand(0x001D);
+    delay(20);
+    if (MB_PIN_CFETOFF >= 0) digitalWrite(MB_PIN_CFETOFF, LOW);
+    uint16_t stat = 0;
+    for (int i = 0; i < 5; i++) { delay(20); stat = bms.directCommandRead(0x7F); if ((stat & 0x01) != 0) break; }
+    isCharging = (stat & 0x01) != 0;
+    Serial.printf("[FET] CHG_ON complete: FETStatus=0x%04X, CHG_FET=%s\n", stat, isCharging ? "ON" : "OFF");
+    return isCharging ? RC_OK : RC_OK_VETO_CHG;
+
+  } else if (strcmp(action, "chgOff") == 0) {
+    Serial.println("=== CHG OFF REQUEST ===");
+    if (MB_PIN_CFETOFF >= 0) digitalWrite(MB_PIN_CFETOFF, HIGH);
+    delay(50);
+    uint16_t stat = bms.directCommandRead(0x7F);
+    isCharging = (stat & 0x01) != 0;
+    return RC_OK;
+
+  } else if (strcmp(action, "dsgOn") == 0) {
+    Serial.println("=== DSG ON REQUEST ===");
+    bms.CommandOnlysubCommand(0x001D);
+    delay(20);
+    if (MB_PIN_DFETOFF >= 0) digitalWrite(MB_PIN_DFETOFF, LOW);
+    uint16_t stat = 0;
+    for (int i = 0; i < 5; i++) { delay(20); stat = bms.directCommandRead(0x7F); if ((stat & 0x04) != 0) break; }
+    isDischarging = (stat & 0x04) != 0;
+    Serial.printf("[FET] DSG_ON complete: FETStatus=0x%04X, DSG_FET=%s\n", stat, isDischarging ? "ON" : "OFF");
+    return RC_OK;
+
+  } else if (strcmp(action, "dsgOff") == 0) {
+    Serial.println("=== DSG OFF REQUEST ===");
+    if (MB_PIN_DFETOFF >= 0) digitalWrite(MB_PIN_DFETOFF, HIGH);
+    delay(50);
+    uint16_t stat = bms.directCommandRead(0x7F);
+    isDischarging = (stat & 0x04) != 0;
+    return RC_OK;
+
+  } else if (strcmp(action, "allFetsOn") == 0) {
+    Serial.println("=== ALL FETS ON (EXIT MAINTENANCE) ===");
+    bms.CommandOnlysubCommand(0x001D);
+    delay(20);
+    if (MB_PIN_CFETOFF >= 0) digitalWrite(MB_PIN_CFETOFF, LOW);
+    if (MB_PIN_DFETOFF >= 0) digitalWrite(MB_PIN_DFETOFF, LOW);
+    delay(100);
+    uint16_t stat = bms.directCommandRead(0x7F);
+    isCharging = (stat & 0x01) != 0;
+    isDischarging = (stat & 0x04) != 0;
+    float V_cell = (float)cellVoltages[0] / 1000.0f;
+    float I_current = (float)bmsCurrent / 1000.0f;
+    float soc_est = smartSOCInit(V_cell, I_current);
+    initial_ekf_soc = soc_est;
+    software_charge_Ah = 0.0f;
+    ekf.begin(soc_est);
+    Serial.printf("[EKF] Post-Maintenance Reset. SOC snapped to %.1f%%\n", soc_est);
+    return RC_OK;
+
+  } else if (strcmp(action, "allFetsOff") == 0) {
+    Serial.println("=== ALL FETS OFF (ENTER MAINTENANCE) ===");
+    if (MB_PIN_CFETOFF >= 0) digitalWrite(MB_PIN_CFETOFF, HIGH);
+    if (MB_PIN_DFETOFF >= 0) digitalWrite(MB_PIN_DFETOFF, HIGH);
+    delay(100);
+    uint16_t stat = bms.directCommandRead(0x7F);
+    isCharging = (stat & 0x01) != 0;
+    isDischarging = (stat & 0x04) != 0;
+    return RC_OK;
+
+  } else if (strcmp(action, "clearFaults") == 0) {
+    Serial.println("=== MANUAL FAULT CLEAR ===");
+    clearBmsAlarms();
+    bms.CommandOnlysubCommand(0x001D);
+    watchdogFaultLocked = false;
+    addLog(0x62, 0x00FF, true, true);
+    return RC_OK;
+
+  } else if (strcmp(action, "pfReset") == 0) {
+    Serial.println("=== PERMANENT FAILURE RESET (0x0029) ===");
+    bms.CommandOnlysubCommand(0x0029);
+    addLog(0x3E, 0x0029, true, true);
+    return RC_OK;
+
+  } else if (strcmp(action, "resetCharge") == 0) {
+    bms.ResetAccumulatedCharge();
+    last_cc_reset_time = millis();
+    software_charge_Ah = 0.0f;
+    addLog(0x3E, 0x0082, true, true);
+    return RC_OK;
+
+  } else if (strcmp(action, "toggleBal") == 0) {
+    int newMode = (currentBalMode == BAL_MODE_AUTONOMOUS) ? BAL_MODE_HOST_ALGO : BAL_MODE_AUTONOMOUS;
+    prefs.putInt("bal_mode", newMode);
+    Serial.printf("[UI] Balancing mode saved to NVS: %d. Pending restart.\n", newMode);
+    if (msgOut) snprintf(msgOut, msgLen, "Balancing mode updated!\\n\\nPlease click Reset BMS IC to apply this configuration safely.");
+    return RC_OK;
+
+  } else if (strcmp(action, "toggleBalMaster") == 0) {
+    balancingEnabled = !balancingEnabled;
+    prefs.putBool("bal_master", balancingEnabled);
+    Serial.printf("[UI] Master Balancing saved to NVS: %d.\n", balancingEnabled);
+    if (!balancingEnabled) {
+      if (powerMode == 1) { wakeBms(); delay(10); }
+      bms.setBalancingMask(0);
+    }
+    if (msgOut) {
+      if (currentBalMode == BAL_MODE_AUTONOMOUS)
+        snprintf(msgOut, msgLen, "Master Balancing saved!\\n\\nSince you are in Autonomous Mode, you MUST click Reset BMS IC to safely apply this change.");
+      else
+        snprintf(msgOut, msgLen, "Master Balancing updated instantly!");
+    }
+    return RC_OK;
+
+  } else if (strcmp(action, "reset") == 0) {
+    Serial.println("=== FULL SYSTEM RESET INITIATED ===");
+    bms.reset();
+    addLog(0x3E, 0x0012, true, true);
+    if (msgOut) snprintf(msgOut, msgLen, "System rebooting... Please wait 5 seconds.");
+    return RC_OK_REBOOT;
+
+  } else if (strcmp(action, "toggleAutoSleep") == 0) {
+    autoSleepEnabled = !autoSleepEnabled;
+    prefs.putBool("auto_sleep", autoSleepEnabled);
+    Serial.printf("[UI] Auto Sleep toggled: %d\n", autoSleepEnabled);
+    if (autoSleepEnabled) bms.CommandOnlysubCommand(0x0099);
+    else bms.CommandOnlysubCommand(0x009A);
+    if (msgOut) snprintf(msgOut, msgLen, "Sleep mode toggled successfully!");
+    return RC_OK;
+
+  } else if (strcmp(action, "pwrDeep") == 0) {
+    Serial.println("[PWR] >>> DEEP SLEEP command received");
+    int16_t vld = (int16_t)bms.directCommandRead(0x38);
+    if (vld > 1500) {
+      Serial.printf("[PWR] DEEP SLEEP VETO: LD pin is HIGH (%d mV)\n", vld);
+      if (msgOut) snprintf(msgOut, msgLen, "DEEP SLEEP WARNING:\\n\\nThe LD (Load Detect) pin is reading HIGH (%d mV).\\n\\nThe BQ76952 cannot stay in Deep Sleep while the LD pin is driven high (e.g. charger attached).", vld);
+      return RC_ERR_DEEP_LD_HIGH;
+    }
+    uint16_t ssA = bms.directCommandRead(0x03), ssB = bms.directCommandRead(0x05), ssC = bms.directCommandRead(0x07);
+    if (ssA > 0 || ssB > 0 || ssC > 0) {
+      Serial.printf("[PWR] DEEP SLEEP VETO: Faults active (A:%02X B:%02X C:%02X)\n", ssA, ssB, ssC);
+      if (msgOut) snprintf(msgOut, msgLen, "DEEP SLEEP WARNING:\\n\\nThe BQ76952 cannot enter Deep Sleep while safety faults are active.\\n\\nPlease clear all protections first!");
+      return RC_ERR_DEEP_FAULTS;
+    }
+    pendingPwrMode = 2;
+    bms.CommandOnlysubCommand(0x009A);
+    delay(50);
+    bms.writeByteToMemory(0x9335, 0x00);
+    bms.setBalancingMask(0);
+    delay(150);
+    bms.directCommandWrite(0x62, 0xFF);
+    bms.directCommandWrite(0x63, 0xFF);
+    delay(20);
+    bms.CommandOnlysubCommand(0x000F);
+    delay(500);
+    bms.CommandOnlysubCommand(0x000F);
+    lastRead = millis();
+    pwrCommandTime = millis();
+    Serial.println("[PWR] DEEPSLEEP sent (x2). I2C dying...");
+    return RC_OK;
+
+  } else if (strcmp(action, "pwrWake") == 0) {
+    Serial.println("[PWR] >>> WAKE command received");
+    bms.directCommandRead(0x12);
+    delay(20);
+    bms.CommandOnlysubCommand(0x009A);
+    delay(50);
+    bms.CommandOnlysubCommand(0x009A);
+    delay(50);
+    bms.CommandOnlysubCommand(0x000E);
+    delay(1000);
+    bms.writeByteToMemory(0x9335, (balancingEnabled && currentBalMode == BAL_MODE_AUTONOMOUS) ? 0x4F : 0x00);
+    delay(50);
+    bms.directCommandWrite(0x66, 0xFF);
+    bms.directCommandWrite(0x67, 0xFF);
+    bms.directCommandWrite(0x62, 0xFF);
+    bms.directCommandWrite(0x63, 0xFF);
+    pendingPwrMode = 3;
+    pwrCommandTime = millis();
+    lastRead = millis();
+    Serial.println("[PWR] Wake routine complete. Waiting for BatStatus confirmation...");
+    return RC_OK;
+
+  } else if (strcmp(action, "pchgTog") == 0) {
+    if (lastFetStat & 0x01) {
+      if (msgOut) snprintf(msgOut, msgLen, "Cannot enable Precharge (PCHG) while the main Charge (CHG) FET is active.\\n\\nPlease turn off CHG first.");
+      return RC_ERR_PCHG_CONFLICT;
+    }
+    bms.CommandOnlysubCommand(0x001E);
+    Serial.println("[TEST] PCHG Toggle Subcommand (0x001E) Sent.");
+    return RC_OK;
+
+  } else if (strcmp(action, "pdsgTog") == 0) {
+    if (lastFetStat & 0x04) {
+      if (msgOut) snprintf(msgOut, msgLen, "Cannot enable Pre-Discharge (PDSG) while the main Discharge (DSG) FET is active.\\n\\nPlease turn off DSG first.");
+      return RC_ERR_PDSG_CONFLICT;
+    }
+    bms.CommandOnlysubCommand(0x001C);
+    Serial.println("[TEST] PDSG Toggle Subcommand (0x001C) Sent.");
+    return RC_OK;
+
+  } else if (strcmp(action, "chgTog") == 0) {
+    if (lastFetStat & 0x02) {
+      if (msgOut) snprintf(msgOut, msgLen, "Cannot enable the main Charge (CHG) FET while Precharge (PCHG) is active.\\n\\nPlease turn off PCHG first to prevent inrush currents.");
+      return RC_ERR_CHG_CONFLICT;
+    }
+    bms.CommandOnlysubCommand(0x001F);
+    Serial.println("[TEST] CHG Toggle Subcommand (0x001F) Sent.");
+    return RC_OK;
+
+  } else if (strcmp(action, "dsgTog") == 0) {
+    if (lastFetStat & 0x08) {
+      if (msgOut) snprintf(msgOut, msgLen, "Cannot enable the main Discharge (DSG) FET while Pre-Discharge (PDSG) is active.\\n\\nPlease turn off PDSG first to prevent inrush currents.");
+      return RC_ERR_DSG_CONFLICT;
+    }
+    bms.CommandOnlysubCommand(0x0020);
+    Serial.println("[TEST] DSG Toggle Subcommand (0x0020) Sent.");
+    return RC_OK;
+
+  } else if (strcmp(action, "fetMasterToggle") == 0) {
+    bms.CommandOnlysubCommand(0x0022);
+    Serial.println("[TB] FET Master Toggle (0x0022)");
+    return RC_OK;
+
+  } else if (strcmp(action, "setHostBalParams") == 0) {
+    hostBalTriggerMv = arg0;
+    hostBalDeltaMv = arg1;
+    prefs.putUShort("trig", hostBalTriggerMv);
+    prefs.putUShort("delta", hostBalDeltaMv);
+    Serial.printf("[HOST-BAL] Settings Updated: Trigger=%dmV, Delta=%dmV\n", hostBalTriggerMv, hostBalDeltaMv);
+    return RC_OK;
+  }
+  return RC_ERR_UNKNOWN;
+}
+
+// Persist the 12 protection thresholds to NVS (caller decides when to reboot).
+void applyConfigWrite(uint16_t cuv, uint16_t cuv_d, uint16_t cov, uint16_t cov_d,
+                      uint16_t occ, uint16_t occ_d, uint16_t ocd1, uint16_t ocd1_d,
+                      uint16_t ocd2, uint16_t ocd2_d, uint8_t scd, uint8_t scd_d) {
+  extern Preferences prefs;
+  prefs.putUShort("cuv", cuv);   prefs.putUShort("cuv_d", cuv_d);
+  prefs.putUShort("cov", cov);   prefs.putUShort("cov_d", cov_d);
+  prefs.putUShort("occ", occ);   prefs.putUShort("occ_d", occ_d);
+  prefs.putUShort("ocd1", ocd1); prefs.putUShort("ocd1_d", ocd1_d);
+  prefs.putUShort("ocd2", ocd2); prefs.putUShort("ocd2_d", ocd2_d);
+  prefs.putUChar("scd", scd);    prefs.putUChar("scd_d", scd_d);
+}
+
+// Reset the EKF + coulomb counter; returns the re-initialized SOC.
+float runEkfReset() {
+  float V_cell = (float)cellVoltages[0] / 1000.0f;
+  float I_current = (float)bmsCurrent / 10000.0f;
+  float soc_est = smartSOCInit(V_cell, I_current);
+  initial_ekf_soc = soc_est;
+  software_charge_Ah = 0.0f;
+  bms.ResetAccumulatedCharge();
+  ekf.begin(soc_est);
+  Serial.printf("[EKF] Manual Reset to %.1f%%\n", soc_est);
+  return soc_est;
+}
+
+// Map an ESP-NOW op code to the action string runDeviceCommand expects.
+const char *opToAction(uint8_t op) {
+  switch (op) {
+    case OP_CHG_ON: return "chgOn";   case OP_CHG_OFF: return "chgOff";
+    case OP_DSG_ON: return "dsgOn";   case OP_DSG_OFF: return "dsgOff";
+    case OP_ALL_FETS_ON: return "allFetsOn"; case OP_ALL_FETS_OFF: return "allFetsOff";
+    case OP_CHG_TOG: return "chgTog"; case OP_DSG_TOG: return "dsgTog";
+    case OP_PCHG_TOG: return "pchgTog"; case OP_PDSG_TOG: return "pdsgTog";
+    case OP_FET_MASTER_TOGGLE: return "fetMasterToggle";
+    case OP_CLEAR_FAULTS: return "clearFaults"; case OP_PF_RESET: return "pfReset";
+    case OP_RESET: return "reset"; case OP_RESET_CHARGE: return "resetCharge";
+    case OP_TOGGLE_BAL: return "toggleBal"; case OP_TOGGLE_BAL_MASTER: return "toggleBalMaster";
+    case OP_TOGGLE_AUTO_SLEEP: return "toggleAutoSleep";
+    case OP_PWR_DEEP: return "pwrDeep"; case OP_PWR_WAKE: return "pwrWake";
+    case OP_SET_HOST_BAL: return "setHostBalParams";
+    default: return "";
+  }
+}
+
+// Fill a full read-only snapshot from the same globals handleApiData serializes,
+// so the cloud admin view can never drift from the local AP dashboard.
+void packAdminSnapshot(AdminSnapshot *s, uint16_t reqSeq) {
+  extern uint8_t hw_cfg_cb, hw_cfg_protA, hw_cfg_protB;
+  memset(s, 0, sizeof(*s));
+  s->magic = ADMIN_SNAPSHOT_MAGIC;
+  s->reqSeq = reqSeq;
+  for (int i = 0; i < 16; i++) { s->v[i] = (uint16_t)cellVoltages[i]; s->cellBalTimes[i] = cellBalancingTimes[i]; }
+  s->vStack = (uint16_t)vStack; s->vPack = (uint16_t)vPack;
+  s->current = bmsCurrent;
+  s->charge = software_charge_Ah * 1000.0f;  // mAh, matches handleApiData
+  s->chargeTime = chargeTime;
+  s->chipTemp = chipTemp; s->temp1 = temp1; s->temp2 = temp2; s->temp3 = temp3;
+  s->soc_ekf = soc_ekf; s->soh = sohEngine.getSOH();
+  s->soc_uncertainty = soc_uncertainty; s->vErr = voltage_error_ekf;
+  float cc = 0.0f;
+  if (initial_ekf_soc >= 0.0f)
+    cc = constrain(initial_ekf_soc + (software_charge_Ah / ((float)MB_PARALLEL_CELLS * MB_CELL_CAPACITY_AH)) * 100.0f, 0.0f, 100.0f);
+  s->cc_soc = cc;
+  float st[4] = {0, 0, 0, 0}; ekf.getStates(st);
+  s->vrc1 = st[1]; s->vrc2 = st[2]; s->vrc3 = st[3];
+  float absA = fabsf((float)bmsCurrent / 1000.0f); float tr = -1.0f;
+  if (absA > 0.02f) {
+    float rem = (soc_ekf / 100.0f) * (float)MB_PARALLEL_CELLS * MB_CELL_CAPACITY_AH;
+    tr = (bmsCurrent < 0) ? rem / absA
+                          : (((100.0f - soc_ekf) / 100.0f) * (float)MB_PARALLEL_CELLS * MB_CELL_CAPACITY_AH) / absA;
+  }
+  s->timeRemain = tr;
+  s->saA = saA_val; s->saB = saB_val; s->saC = saC_val;
+  s->ssA = ssA_val; s->ssB = ssB_val; s->ssC = ssC_val;
+  s->pfA = pfA_val; s->pfB = pfB_val; s->pfC = pfC_val; s->pfD = pfD_val;
+  s->batStat = batStatusReg; s->manStat = manufStatus;
+  s->balMask = balancingMask; s->balMode = currentBalMode;
+  s->balSuspended = balSuspended ? 1 : 0; s->hwBalActive = isHardwareBalancing ? 1 : 0;
+  s->balTrig = hostBalTriggerMv; s->balDelta = hostBalDeltaMv;
+  s->totalBalTime = (uint16_t)totalBalancingTime; s->cellDelta = (uint16_t)cellBalancingDelta;
+  s->minV = (uint16_t)minCellV; s->maxV = (uint16_t)maxCellV;
+  s->pwr = powerMode; s->pendingPwr = pendingPwrMode;
+  s->isCharging = isCharging ? 1 : 0; s->isDischarging = isDischarging ? 1 : 0;
+  s->autoSleep = autoSleepEnabled ? 1 : 0; s->fetEn = fetEn ? 1 : 0;
+  s->balMaster = balancingEnabled ? 1 : 0; s->wdFault = watchdogFaultLocked ? 1 : 0;
+  s->ledState = ledState ? 1 : 0;
+  s->protBits = (protStatus.bits.SC_DCHG ? 1 : 0) | (protStatus.bits.OC2_DCHG ? 2 : 0) |
+                (protStatus.bits.OC1_DCHG ? 4 : 0) | (protStatus.bits.OC_CHG ? 8 : 0) |
+                (protStatus.bits.CELL_OV ? 16 : 0) | (protStatus.bits.CELL_UV ? 32 : 0);
+  s->tempBits = (tempStatus.bits.OVERTEMP_FET ? 1 : 0) | (tempStatus.bits.OVERTEMP_INTERNAL ? 2 : 0) |
+                (tempStatus.bits.OVERTEMP_DCHG ? 4 : 0) | (tempStatus.bits.OVERTEMP_CHG ? 8 : 0) |
+                (tempStatus.bits.UNDERTEMP_INTERNAL ? 16 : 0) | (tempStatus.bits.UNDERTEMP_DCHG ? 32 : 0) |
+                (tempStatus.bits.UNDERTEMP_CHG ? 64 : 0);
+  s->fetBits = ((lastFetStat & 0x02) ? 1 : 0) | ((lastFetStat & 0x08) ? 2 : 0) |
+               ((lastFetStat & 0x20) ? 4 : 0) | ((lastFetStat & 0x10) ? 8 : 0) |
+               ((controlStatus & 0x1000) ? 16 : 0);
+  s->cfg_cb = hw_cfg_cb; s->cfg_protA = hw_cfg_protA; s->cfg_protB = hw_cfg_protB;
+  s->lastCmdRc = g_lastCmdRc;
+}
+
 void handleApiConfigGet() {
   extern Preferences prefs;
   String json = "{";
@@ -1289,361 +1641,45 @@ void handleApiConfigGet() {
 }
 
 void handleApiConfigPost() {
-  extern Preferences prefs;
-  
-  uint16_t cuv_mv = server.arg("cuv").toInt();
-  uint16_t cuv_d  = server.arg("cuv_d").toInt();
-  uint16_t cov_mv = server.arg("cov").toInt();
-  uint16_t cov_d  = server.arg("cov_d").toInt();
-  uint16_t occ_a  = server.arg("occ").toInt();
-  uint16_t occ_d  = server.arg("occ_d").toInt();
-  uint16_t ocd1_a = server.arg("ocd1").toInt();
-  uint16_t ocd1_d = server.arg("ocd1_d").toInt();
-  uint16_t ocd2_a = server.arg("ocd2").toInt();
-  uint16_t ocd2_d = server.arg("ocd2_d").toInt();
-  uint8_t scd_raw   = server.arg("scd").toInt();
-  uint8_t scd_d_raw = server.arg("scd_d").toInt();
-
-  prefs.putUShort("cuv", cuv_mv);
-  prefs.putUShort("cuv_d", cuv_d);
-  prefs.putUShort("cov", cov_mv);
-  prefs.putUShort("cov_d", cov_d);
-  prefs.putUShort("occ", occ_a);
-  prefs.putUShort("occ_d", occ_d);
-  prefs.putUShort("ocd1", ocd1_a);
-  prefs.putUShort("ocd1_d", ocd1_d);
-  prefs.putUShort("ocd2", ocd2_a);
-  prefs.putUShort("ocd2_d", ocd2_d);
-  prefs.putUChar("scd", scd_raw);
-  prefs.putUChar("scd_d", scd_d_raw);
+  applyConfigWrite(
+      server.arg("cuv").toInt(),  server.arg("cuv_d").toInt(),
+      server.arg("cov").toInt(),  server.arg("cov_d").toInt(),
+      server.arg("occ").toInt(),  server.arg("occ_d").toInt(),
+      server.arg("ocd1").toInt(), server.arg("ocd1_d").toInt(),
+      server.arg("ocd2").toInt(), server.arg("ocd2_d").toInt(),
+      server.arg("scd").toInt(),  server.arg("scd_d").toInt());
 
   server.send(200, "application/json", "{\"status\":\"ok\"}");
-  
   // Give the server 500ms to send the HTTP 200 OK before rebooting
-  delay(500); 
+  delay(500);
   ESP.restart();
 }
 
 void handleApiCmd() {
+  // Thin adapter over the shared dispatcher (runDeviceCommand). Reproduces the
+  // exact JSON the local AP dashboard JS expects so that UI is unchanged.
   String action = server.arg("action");
-  if (action == "chgOn") {
-    Serial.println("=== CHG ON REQUEST ===");
-    bms.CommandOnlysubCommand(0x001D); // 1. Clear Permanent Failures FIRST
-    delay(20);
-    if (MB_PIN_CFETOFF >= 0) digitalWrite(MB_PIN_CFETOFF, LOW); // 2. Remove HW block. BQ will now natively turn it ON.
+  uint16_t a0 = (uint16_t)server.arg("trigger").toInt();
+  uint16_t a1 = (uint16_t)server.arg("delta").toInt();
+  char msg[256];
+  CmdRc rc = runDeviceCommand(action.c_str(), a0, a1, msg, sizeof(msg));
 
-    uint16_t stat = 0;
-    for (int i = 0; i < 5; i++) {
-      delay(20);
-      stat = bms.directCommandRead(0x7F);
-      if ((stat & 0x01) != 0)
-        break;
-    }
-
-    isCharging = (stat & 0x01) != 0;
-    Serial.printf("[FET] CHG_ON complete: FETStatus=0x%04X, CHG_FET=%s\n", stat,
-                  isCharging ? "ON" : "OFF");
-    if (!isCharging)
-      Serial.printf("[FET] BQ Vetoed CHG! Safety Status A: 0x%02X\n",
-                    bms.directCommandRead(0x03));
-
-  } else if (action == "chgOff") {
-    Serial.println("=== CHG OFF REQUEST ===");
-    if (MB_PIN_CFETOFF >= 0) digitalWrite(MB_PIN_CFETOFF, HIGH); // Force Hardware Block
-    delay(50);
-
-    uint16_t stat = bms.directCommandRead(0x7F);
-    isCharging = (stat & 0x01) != 0; // SYNC UI INSTANTLY
-    Serial.printf("[FET] CHG_OFF complete: FETStatus=0x%04X, CHG_FET=%s\n",
-                  stat, isCharging ? "ON" : "OFF");
-
-  } else if (action == "dsgOn") {
-    Serial.println("=== DSG ON REQUEST ===");
-    bms.CommandOnlysubCommand(0x001D); // 1. Clear Permanent Failures FIRST
-    delay(20);
-    if (MB_PIN_DFETOFF >= 0) digitalWrite(MB_PIN_DFETOFF, LOW); // 2. Remove HW block. BQ will now natively turn it ON.
-
-    uint16_t stat = 0;
-    for (int i = 0; i < 5; i++) {
-      delay(20);
-      stat = bms.directCommandRead(0x7F);
-      if ((stat & 0x04) != 0)
-        break;
-    }
-
-    isDischarging = (stat & 0x04) != 0; // SYNC UI INSTANTLY
-    Serial.printf("[FET] DSG_ON complete: FETStatus=0x%04X, DSG_FET=%s\n", stat,
-                  isDischarging ? "ON" : "OFF");
-    if (!isDischarging)
-      Serial.printf("[FET] BQ Vetoed DSG! Safety Status A: 0x%02X\n",
-                    bms.directCommandRead(0x03));
-
-  } else if (action == "dsgOff") {
-    Serial.println("=== DSG OFF REQUEST ===");
-    if (MB_PIN_DFETOFF >= 0) digitalWrite(MB_PIN_DFETOFF, HIGH); // Force Hardware Block
-    delay(50);
-
-    uint16_t stat = bms.directCommandRead(0x7F);
-    isDischarging = (stat & 0x04) != 0; // SYNC UI INSTANTLY
-    Serial.printf("[FET] DSG_OFF complete: FETStatus=0x%04X, DSG_FET=%s\n",
-                  stat, isDischarging ? "ON" : "OFF");
-
-  } else if (action == "allFetsOn") {
-    // EXIT MAINTENANCE MODE: Wake FETs & purge EKF noise
-    Serial.println("=== ALL FETS ON (EXIT MAINTENANCE) ===");
-    bms.CommandOnlysubCommand(0x001D);
-    delay(20);
-    if (MB_PIN_CFETOFF >= 0) digitalWrite(MB_PIN_CFETOFF, LOW);
-    if (MB_PIN_DFETOFF >= 0) digitalWrite(MB_PIN_DFETOFF, LOW);
-    delay(100);
-    uint16_t stat = bms.directCommandRead(0x7F);
-    isCharging = (stat & 0x01) != 0;
-    isDischarging = (stat & 0x04) != 0;
-
-    // PURGE EKF: Pack was disconnected, voltage will bounce.
-    float V_cell = (float)cellVoltages[0] / 1000.0f;
-    float I_current = (float)bmsCurrent / 1000.0f; // bmsCurrent is in mA
-    float soc_est = smartSOCInit(V_cell, I_current);
-    initial_ekf_soc = soc_est;
-    software_charge_Ah = 0.0f;
-    ekf.begin(soc_est);
-    Serial.printf("[EKF] Post-Maintenance Reset. SOC snapped to %.1f%%\n",
-                  soc_est);
-
-  } else if (action == "allFetsOff") {
-    Serial.println("=== ALL FETS OFF (ENTER MAINTENANCE) ===");
-    if (MB_PIN_CFETOFF >= 0) digitalWrite(MB_PIN_CFETOFF, HIGH);
-    if (MB_PIN_DFETOFF >= 0) digitalWrite(MB_PIN_DFETOFF, HIGH);
-    delay(100);
-    uint16_t stat = bms.directCommandRead(0x7F);
-    isCharging = (stat & 0x01) != 0;
-    isDischarging = (stat & 0x04) != 0;
-
-  } else if (action == "clearFaults") {
-    Serial.println("=== MANUAL FAULT CLEAR ===");
-    clearBmsAlarms();
-    bms.CommandOnlysubCommand(0x001D); // Send CLEAR_SAFETY to unlatch FET protections (OCD/SCD)
-    watchdogFaultLocked = false;
-    addLog(0x62, 0x00FF, true, true);
-    Serial.println("[WATCHDOG] Faults cleared. ALERT LED unlocked.");
-  } else if (action == "pfReset") {
-    Serial.println("=== PERMANENT FAILURE RESET (0x0029) ===");
-    bms.CommandOnlysubCommand(0x0029);
-    addLog(0x3E, 0x0029, true, true);
-    Serial.println("[WATCHDOG] Sent PF_RESET command.");
-  } else if (action == "resetCharge") {
-    bms.ResetAccumulatedCharge();
-    last_cc_reset_time = millis();
-    software_charge_Ah = 0.0f;
-    addLog(0x3E, 0x0082, true, true);
-  } else if (action == "toggleBal") {
-    // RESTART TO APPLY: Save intention to NVS, don't touch BQ hardware
-    int newMode = (currentBalMode == BAL_MODE_AUTONOMOUS) ? BAL_MODE_HOST_ALGO
-                                                          : BAL_MODE_AUTONOMOUS;
-    prefs.putInt("bal_mode", newMode);
-    Serial.printf("[UI] Balancing mode saved to NVS: %d. Pending restart.\n",
-                  newMode);
-    String resp =
-        "{\"status\":\"ok\",\"message\":\"Balancing mode updated!\\n\\nPlease "
-        "click Reset BMS IC to apply this configuration safely.\"}";
-    server.send(200, "application/json", resp);
-    return;
-
-  } else if (action == "toggleBalMaster") {
-    balancingEnabled = !balancingEnabled;
-    prefs.putBool("bal_master", balancingEnabled);
-    Serial.printf("[UI] Master Balancing saved to NVS: %d.\n",
-                  balancingEnabled);
-
-    // If turned off, immediately kill hardware balancing
-    if (!balancingEnabled) {
-      if (powerMode == 1) {
-        wakeBms();
-        delay(10);
-      } // Wake to turn OFF!
-      bms.setBalancingMask(0);
-    }
-
-    String resp;
-    if (currentBalMode == BAL_MODE_AUTONOMOUS) {
-      resp = "{\"status\":\"ok\",\"message\":\"Master Balancing saved!\\n\\n"
-             "Since you are in Autonomous Mode, you MUST click Reset BMS IC to "
-             "safely apply this change.\"}";
-    } else {
-      resp = "{\"status\":\"ok\",\"message\":\"Master Balancing updated "
-             "instantly!\"}";
-    }
-    server.send(200, "application/json", resp);
-    return;
-
-  } else if (action == "reset") {
-    Serial.println("=== FULL SYSTEM RESET INITIATED ===");
-    bms.reset();
-    addLog(0x3E, 0x0012, true, true);
-    server.send(200, "application/json",
-                "{\"status\":\"ok\",\"message\":\"System rebooting... Please "
-                "wait 5 seconds.\"}");
-    delay(1000);
-    ESP.restart();
-  } else if (action == "toggleAutoSleep") {
-    autoSleepEnabled = !autoSleepEnabled;
-    prefs.putBool("auto_sleep", autoSleepEnabled);
-    Serial.printf("[UI] Auto Sleep toggled: %d\n", autoSleepEnabled);
-    if (autoSleepEnabled) {
-      bms.CommandOnlysubCommand(0x0099); // SLEEP_ENABLE
-    } else {
-      bms.CommandOnlysubCommand(0x009A); // SLEEP_DISABLE
-    }
-    String resp =
-        "{\"status\":\"ok\",\"message\":\"Sleep mode toggled successfully!\"}";
-    server.send(200, "application/json", resp);
-    return;
-  } else if (action == "pwrDeep") {
-    Serial.println("============================================");
-    Serial.println("[PWR] >>> DEEP SLEEP command received from dashboard");
-
-    // 1. Read LD Pin Voltage (Direct Command 0x38 = VLD)
-    int16_t vld = (int16_t)bms.directCommandRead(0x38); // returns mV
-    if (vld > 1500) {
-      Serial.printf("[PWR] DEEP SLEEP VETO: LD pin is HIGH (%d mV)\n", vld);
-      String resp =
-          "{\"status\":\"error\",\"message\":\"DEEP SLEEP WARNING:\\n\\nThe LD "
-          "(Load Detect) pin on this testboard is currently reading HIGH (" +
-          String(vld) +
-          " mV).\\n\\nThe BQ76952 cannot stay in Deep Sleep while the LD pin "
-          "is driven high (e.g. charger attached).\"}";
-      server.send(200, "application/json", resp);
-      return;
-    }
-
-    // 2. Check for active safety faults
-    uint16_t ssA = bms.directCommandRead(0x03);
-    uint16_t ssB = bms.directCommandRead(0x05);
-    uint16_t ssC = bms.directCommandRead(0x07);
-    if (ssA > 0 || ssB > 0 || ssC > 0) {
-      Serial.printf(
-          "[PWR] DEEP SLEEP VETO: Faults active (A:%02X B:%02X C:%02X)\n", ssA,
-          ssB, ssC);
-      String resp =
-          "{\"status\":\"error\",\"message\":\"DEEP SLEEP WARNING:\\n\\nThe "
-          "BQ76952 cannot enter Deep Sleep mode while safety faults are "
-          "active.\\n\\nPlease clear all protections first!\"}";
-      server.send(200, "application/json", resp);
-      return;
-    }
-
-    pendingPwrMode = 2;
-
-    // 1. MUST wake the chip first, or it ignores balancing commands!
-    bms.CommandOnlysubCommand(0x009A); // SLEEP_DISABLE
-    delay(50);
-
-    // 2. MUST kill balancing, or Deep Sleep is permanently blocked!
-    bms.writeByteToMemory(0x9335, 0x00); // HARD KILL Autonomous Balancing
-    bms.setBalancingMask(0);             // HARD KILL Host Balancing
-    delay(150); // Allow physical balancing FETs time to turn off
-
-    // 3. Clear leftover alarms so FULLSCAN doesn't trigger a false
-    // readBMSData()
-    bms.directCommandWrite(0x62, 0xFF);
-    bms.directCommandWrite(0x63, 0xFF);
-    delay(20);
-
-    // 4. Send DEEPSLEEP (x2)
-    bms.CommandOnlysubCommand(0x000F);
-    delay(500);
-    bms.CommandOnlysubCommand(0x000F);
-
-    lastRead = millis();       // Prevent immediate race-condition read
-    pwrCommandTime = millis(); // Timestamp for DEEPSLEEP detection in loop()
-    Serial.println("[PWR] DEEPSLEEP sent (x2). I2C dying...");
-    Serial.println("============================================");
-
-  } else if (action == "pwrWake") {
-    Serial.println("============================================");
-    Serial.println("[PWR] >>> WAKE command received from dashboard");
-
-    bms.directCommandRead(
-        0x12); // DUMMY READ: Wake up the I2C communication engine!
-    delay(20);
-
-    bms.CommandOnlysubCommand(0x009A); // SLEEP_DISABLE
-    delay(50);
-    bms.CommandOnlysubCommand(
-        0x009A); // DOUBLE SEND: Guarantee receipt even if it was deep asleep
-    delay(50);
-    bms.CommandOnlysubCommand(0x000E); // EXIT_DEEPSLEEP
-    delay(1000); // Wait 1 second for BQ to complete its measurement loop!
-
-    // Restore balancing configuration to what the dashboard currently expects
-    bms.writeByteToMemory(
-        0x9335, (balancingEnabled && currentBalMode == BAL_MODE_AUTONOMOUS)
-                    ? 0x4F
-                    : 0x00);
-    delay(50);
-
-    // Kickstart the ALERT heartbeat in case it hung during sleep
-    bms.directCommandWrite(0x66, 0xFF);
-    bms.directCommandWrite(0x67, 0xFF);
-    bms.directCommandWrite(0x62, 0xFF);
-    bms.directCommandWrite(0x63, 0xFF);
-
-    // Don't set powerMode=0 yet — wait for BatStatus SLEEP bit to confirm!
-    pendingPwrMode =
-        3; // WAKE PENDING: readBMSData will confirm when bit 15 = 0
-    pwrCommandTime = millis();
-    lastRead = millis(); // Allow polling immediately to catch the confirmation
-    Serial.println(
-        "[PWR] Wake routine complete. Waiting for BatStatus confirmation...");
-    Serial.println("============================================");
-  } else if (action == "pchgTog") {
-    if (lastFetStat & 0x01) {
-      server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Cannot enable Precharge (PCHG) while the main Charge (CHG) FET is active.\\n\\nPlease turn off CHG first.\"}");
-      return;
-    }
-    bms.CommandOnlysubCommand(0x001E); 
-    Serial.println("[TEST] PCHG Toggle Subcommand (0x001E) Sent.");
-  } else if (action == "pdsgTog") {
-    if (lastFetStat & 0x04) {
-      server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Cannot enable Pre-Discharge (PDSG) while the main Discharge (DSG) FET is active.\\n\\nPlease turn off DSG first.\"}");
-      return;
-    }
-    bms.CommandOnlysubCommand(0x001C); 
-    Serial.println("[TEST] PDSG Toggle Subcommand (0x001C) Sent.");
-  } else if (action == "chgTog") {
-    if (lastFetStat & 0x02) {
-      server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Cannot enable the main Charge (CHG) FET while Precharge (PCHG) is active.\\n\\nPlease turn off PCHG first to prevent inrush currents.\"}");
-      return;
-    }
-    bms.CommandOnlysubCommand(0x001F);
-    Serial.println("[TEST] CHG Toggle Subcommand (0x001F) Sent.");
-  } else if (action == "dsgTog") {
-    if (lastFetStat & 0x08) {
-      server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Cannot enable the main Discharge (DSG) FET while Pre-Discharge (PDSG) is active.\\n\\nPlease turn off PDSG first to prevent inrush currents.\"}");
-      return;
-    }
-    bms.CommandOnlysubCommand(0x0020);
-    Serial.println("[TEST] DSG Toggle Subcommand (0x0020) Sent.");
-  } else if (action == "fetMasterToggle") {
-    bms.CommandOnlysubCommand(0x0022);
-    Serial.println("[TB] FET Master Toggle (0x0022)");
-  } else if (action == "setHostBalParams") {
-    hostBalTriggerMv = server.arg("trigger").toInt();
-    hostBalDeltaMv = server.arg("delta").toInt();
-    prefs.putUShort("trig", hostBalTriggerMv);
-    prefs.putUShort("delta", hostBalDeltaMv);
-    Serial.printf("[HOST-BAL] Settings Updated: Trigger=%dmV, Delta=%dmV\n",
-                  hostBalTriggerMv, hostBalDeltaMv);
-  } else {
-    server.send(400, "application/json",
-                "{\"status\":\"error\",\"message\":\"Unknown\"}");
+  if (rc == RC_ERR_UNKNOWN) {
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Unknown\"}");
     return;
   }
-  String resp = "{\"status\":\"ok\"";
-  if (action == "chgOn" && !isCharging)
-    resp += ",\"veto\":\"CHG\"";
+  // FET precharge/discharge conflicts answered 400 historically; LD/fault vetoes 200.
+  int code = (rc == RC_ERR_PCHG_CONFLICT || rc == RC_ERR_PDSG_CONFLICT ||
+              rc == RC_ERR_CHG_CONFLICT  || rc == RC_ERR_DSG_CONFLICT) ? 400 : 200;
+  String resp = "{\"status\":\"";
+  resp += (rc >= RC_ERR_PCHG_CONFLICT) ? "error" : "ok";
+  resp += "\"";
+  if (rc == RC_OK_VETO_CHG) resp += ",\"veto\":\"CHG\"";
+  if (msg[0]) { resp += ",\"message\":\""; resp += msg; resp += "\""; }
   resp += "}";
-  server.send(200, "application/json", resp);
+  server.send(code, "application/json", resp);
+
+  if (rc == RC_OK_REBOOT) { delay(1000); ESP.restart(); }
 }
 
 void handleApiEKFReset() {
@@ -1652,17 +1688,7 @@ void handleApiEKFReset() {
     return;
   }
 
-  float V_cell = (float)cellVoltages[0] / 1000.0f;
-  float I_current = (float)bmsCurrent / 10000.0f;
-  float soc_est = smartSOCInit(V_cell, I_current);
-
-  initial_ekf_soc = soc_est;
-  software_charge_Ah = 0.0f; // Reset our robust software CC!
-  bms.ResetAccumulatedCharge();
-  ekf.begin(soc_est);
-
+  float soc_est = runEkfReset();
   String response = "{\"status\":\"ok\",\"new_soc\":" + String(soc_est) + "}";
   server.send(200, "application/json", response);
-
-  Serial.printf("[EKF] Manual Reset to %.1f%%\n", soc_est);
 }

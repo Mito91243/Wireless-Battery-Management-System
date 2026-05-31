@@ -75,6 +75,9 @@ typedef struct
   uint8_t ss_a;  // BQ76952 Safety Status A (0x03), latched: SCD/OCD2/OCD1/OCC/COV/CUV/SFD/OTP
   uint8_t ss_b;  // BQ76952 Safety Status B (0x05), latched: OTF/OTINT/OTD/OTC/UTINT/UTD/UTC
   uint8_t ss_c;  // BQ76952 Safety Status C (0x07), latched: HWDF/PTO/COVL/PCHGOVR/SCDL/OCDL
+  // --- admin-console command ack: echo of the last ESP-NOW command applied ---
+  uint16_t lastCmdSeq;  // seq of the last SlaveCommand the slave applied (0 = none)
+  uint8_t  lastCmdRc;   // CmdRc result of that command
 } __attribute__((packed)) DeviceMessage;
 
 // ==================== MASTER -> SLAVE HEARTBEAT ====================
@@ -101,5 +104,85 @@ const uint32_t RECOVERY_HOP_INTERVAL_MS = 20000; // offline: how often to hop ba
 const uint32_t RECOVERY_LISTEN_MS       = 1200;  // offline: listen window per hop (kept < AP-client patience)
 const int      RECOVERY_GOOD_HOPS       = 2;     // consecutive good hops required before tearing down the AP (hysteresis)
 const int      RESCAN_AFTER_FAILED_HOPS = 2;     // offline: after this many failed hops on the cached channel, rescan the master's SSID for its (possibly new) channel — recovers from a router channel reassignment
+
+// ==================== ADMIN COMMAND / SNAPSHOT PROTOCOL (cloud <-> slave) ====================
+// Lets the website (admin only) drive the slave's BMS config remotely, mirroring its
+// local AP dashboard. Cloud -> master (MQTT bms/cmd/<masterPairingCode>) -> slave (ESP-NOW).
+// New ESP-NOW frames are discriminated from the heartbeat (0xB7) by length + magic byte.
+const uint8_t SLAVE_CMD_MAGIC      = 0xB8;  // master -> slave command frame
+const uint8_t ADMIN_SNAPSHOT_MAGIC = 0xB9;  // slave -> master full read-only snapshot
+
+// Op codes map 1:1 to the slave's handleApiCmd action strings (stable numeric contract).
+enum SlaveCmdOp : uint8_t {
+  OP_NONE = 0,
+  OP_CHG_ON, OP_CHG_OFF, OP_DSG_ON, OP_DSG_OFF,
+  OP_ALL_FETS_ON, OP_ALL_FETS_OFF,
+  OP_CHG_TOG, OP_DSG_TOG, OP_PCHG_TOG, OP_PDSG_TOG,
+  OP_FET_MASTER_TOGGLE,
+  OP_CLEAR_FAULTS, OP_PF_RESET, OP_RESET, OP_RESET_CHARGE,
+  OP_TOGGLE_BAL, OP_TOGGLE_BAL_MASTER, OP_TOGGLE_AUTO_SLEEP,
+  OP_PWR_DEEP, OP_PWR_WAKE,
+  OP_SET_HOST_BAL,     // arg_u16[0]=trigger mV, arg_u16[1]=delta mV
+  OP_EKF_RESET,
+  OP_SNAPSHOT_REQ,     // request a full read-only snapshot (no args)
+  OP_CONFIG_WRITE      // 12 protection thresholds (cfg block below); reboots the slave
+};
+
+// Dispatcher result codes; echoed to the cloud as DeviceMessage.lastCmdRc. Values >= 10 are errors.
+enum CmdRc : uint8_t {
+  RC_OK = 0,
+  RC_OK_VETO_CHG = 1,        // chgOn issued but the BQ did not enable the CHG FET
+  RC_OK_REBOOT   = 2,        // command applied; slave will reboot shortly
+  RC_ERR_PCHG_CONFLICT = 10,
+  RC_ERR_PDSG_CONFLICT = 11,
+  RC_ERR_CHG_CONFLICT  = 12,
+  RC_ERR_DSG_CONFLICT  = 13,
+  RC_ERR_DEEP_LD_HIGH  = 14,
+  RC_ERR_DEEP_FAULTS   = 15,
+  RC_ERR_UNKNOWN       = 20
+};
+
+typedef struct {
+  uint8_t  magic;        // == SLAVE_CMD_MAGIC
+  uint8_t  op;           // SlaveCmdOp
+  uint16_t seq;          // echoed back in DeviceMessage.lastCmdSeq
+  uint16_t arg_u16[2];   // generic args (setHostBalParams trigger/delta)
+  // protection thresholds — only used when op == OP_CONFIG_WRITE
+  uint16_t cuv, cuv_d, cov, cov_d, occ, occ_d, ocd1, ocd1_d, ocd2, ocd2_d;
+  uint8_t  scd, scd_d;
+} __attribute__((packed)) SlaveCommand;
+
+// Full read-only snapshot (slave -> master, on demand). Field names mirror handleApiData
+// so the master JSON-serialization and the cloud parser stay in sync.
+typedef struct {
+  uint8_t  magic;        // == ADMIN_SNAPSHOT_MAGIC
+  uint8_t  pcode[3];     // slave MAC last 3 bytes (binary) for routing
+  uint16_t reqSeq;       // echoes the SlaveCommand.seq that requested it
+  uint16_t v[16];        // cell mV
+  uint16_t vStack, vPack;
+  int32_t  current;      // mA
+  float    charge;       // mAh (matches handleApiData)
+  uint32_t chargeTime;
+  float    chipTemp, temp1, temp2, temp3;
+  float    soc_ekf, cc_soc, soh, soc_uncertainty, vErr;
+  float    vrc1, vrc2, vrc3, timeRemain;
+  uint16_t saA, saB, saC, ssA, ssB, ssC;
+  uint8_t  pfA, pfB, pfC, pfD;
+  uint16_t batStat, manStat;
+  uint16_t balMask;
+  uint8_t  balMode, balSuspended, hwBalActive;
+  uint16_t balTrig, balDelta, totalBalTime, cellDelta, minV, maxV;
+  uint32_t cellBalTimes[16];
+  uint8_t  pwr, pendingPwr;
+  uint8_t  isCharging, isDischarging, autoSleep, fetEn, balMaster, wdFault, ledState;
+  uint16_t protBits;     // packed prot_* flags
+  uint16_t tempBits;     // packed temp_* flags
+  uint16_t fetBits;      // packed f_pchg/f_pdsg/ddsg/dchg/ldWait flags
+  uint8_t  cfg_cb, cfg_protA, cfg_protB;
+  uint8_t  lastCmdRc;
+} __attribute__((packed)) AdminSnapshot;
+
+static_assert(sizeof(AdminSnapshot) <= 250,
+              "AdminSnapshot exceeds the ESP-NOW 250-byte payload limit — split cellBalTimes into a 2nd frame");
 
 #endif
