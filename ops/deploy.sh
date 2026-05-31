@@ -4,23 +4,47 @@
 # cloud files (backend/frontend/compose/mosquitto) actually changed, so a
 # firmware-only commit doesn't needlessly restart the stack.
 #
-# Deployed copy lives at /root/deploy.sh (decoupled from the pulled tree so a
-# pull never rewrites the script mid-run). cron: */5 * * * * /root/deploy.sh
+# Robustness (so a push "just works"):
+#   * Build failure -> HEAD is rolled back to the previous commit, so the NEXT
+#     run RETRIES instead of advancing HEAD and silently never rebuilding. The
+#     old (working) containers keep running while a build is broken.
+#   * Self-update: the live /root/deploy.sh atomically syncs itself from the
+#     version-controlled ops/deploy.sh (syntax-checked first), so a pushed
+#     script change propagates on the next run — no manual copy needed.
+#   * Dangling images are pruned after a successful rebuild to keep disk in check.
+#
+# Live copy at /root/deploy.sh (decoupled so a pull never rewrites it mid-run).
+# cron: */5 * * * * /root/deploy.sh   |   log: /var/log/wbms-deploy.log
 set -euo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 REPO=/root/Wireless-Battery-Management-System
 LOG=/var/log/wbms-deploy.log
+LIVE=/root/deploy.sh
 cd "$REPO"
 
 exec 9>/tmp/wbms-deploy.lock
 flock -n 9 || exit 0   # single-flight: skip if a previous build is still running
 
-# The broker runs with `allow_anonymous false` + a password_file that is
-# gitignored (secret), so a fresh/wiped deploy would have NO passwd file and
-# mosquitto would silently reject BOTH the master (publisher) and the backend
-# (subscriber) -> zero telemetry. Provision it idempotently with both users
-# before bringing the stack up. Password mirrors docker-compose's MQTT_PASSWORD.
+# Keep the live script in sync with the repo's canonical ops/deploy.sh. Atomic
+# (mv) so the in-flight run is never corrupted; syntax-checked (bash -n) so a
+# broken script can't propagate and brick all future deploys. Effective next run.
+sync_self() {
+  local src="$REPO/ops/deploy.sh"
+  [ -f "$src" ] || return 0
+  cmp -s "$src" "$LIVE" && return 0
+  if bash -n "$src"; then
+    install -m 755 "$src" "$LIVE.new" && mv -f "$LIVE.new" "$LIVE"
+    echo "live deploy script self-updated from ops/deploy.sh"
+  else
+    echo "WARNING: ops/deploy.sh failed syntax check; NOT self-updating"
+  fi
+}
+
+# The broker runs with `allow_anonymous false` + a gitignored password_file, so a
+# fresh/wiped deploy would have NO passwd file and mosquitto would silently reject
+# BOTH the master (publisher) and backend (subscriber) -> zero telemetry.
+# Provision it idempotently with both users. Password mirrors MQTT_PASSWORD.
 ensure_mqtt_passwd() {
   local pf="$REPO/mosquitto/config/passwd"
   local pw="${MQTT_PASSWORD:-mito1234}"
@@ -41,12 +65,23 @@ NEW=$(git rev-parse origin/main)
 {
   echo "=== $(date -u '+%Y-%m-%d %H:%M:%SZ') deploy ${OLD:0:7} -> ${NEW:0:7} ==="
   git merge --ff-only origin/main
+
   if git diff --name-only "$OLD" "$NEW" | grep -qE '^(backend/|frontend/|docker-compose|mosquitto/)'; then
     echo "cloud files changed -> docker compose up -d --build"
     ensure_mqtt_passwd
-    docker compose up -d --build
+    if docker compose up -d --build; then
+      docker image prune -f >/dev/null 2>&1 || true
+      sync_self
+      echo "=== done $(date -u '+%Y-%m-%d %H:%M:%SZ') (rebuilt) ==="
+    else
+      echo "BUILD FAILED -> rolling HEAD back to ${OLD:0:7} so the next run retries"
+      git reset --hard "$OLD"
+      echo "=== FAILED $(date -u '+%Y-%m-%d %H:%M:%SZ') ==="
+      exit 1
+    fi
   else
     echo "no cloud changes (firmware-only) -> skipping container rebuild"
+    sync_self
+    echo "=== done $(date -u '+%Y-%m-%d %H:%M:%SZ') (no rebuild) ==="
   fi
-  echo "=== done $(date -u '+%Y-%m-%d %H:%M:%SZ') ==="
 } >> "$LOG" 2>&1
