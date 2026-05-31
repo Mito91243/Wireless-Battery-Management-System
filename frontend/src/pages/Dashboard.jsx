@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { Battery, BatteryCharging, Zap, AlertTriangle, Activity, History, Clock, TrendingDown, AlertCircle, Home, BarChart3, RefreshCw, Plus, X, Trash2, LogOut, Layers, Unlink, Repeat, Moon, Gauge, Download, Sliders } from 'lucide-react';
+import { Battery, BatteryCharging, Zap, AlertTriangle, Activity, Clock, TrendingDown, AlertCircle, Home, BarChart3, RefreshCw, Plus, X, Trash2, LogOut, Layers, Unlink, Repeat, Moon, Gauge, Download, Sliders } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, ResponsiveContainer, Legend, Tooltip, CartesianGrid, AreaChart, Area } from 'recharts';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
@@ -51,18 +51,6 @@ const timeAgo = (iso) => {
   return `${Math.round(hrs / 24)}d ago`;
 };
 
-const LoadingSpinner = () => (
-  <div className="flex items-center justify-center p-8">
-    <RefreshCw className="h-8 w-8 text-blue-500 animate-spin" />
-  </div>
-);
-
-const ErrorMessage = ({ message }) => (
-  <div className="bg-red-50 border border-red-200 rounded-lg p-4 text-red-700">
-    <AlertCircle className="h-5 w-5 inline mr-2" />
-    {message}
-  </div>
-);
 
 // Battery Grid Component
 // Renders an S × P cell layout: S series positions across, P parallel cells

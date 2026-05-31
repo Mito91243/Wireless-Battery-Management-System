@@ -1161,7 +1161,6 @@ void handleApiData() {
                        0.0f, 100.0f);
   }
   json += ",\"cc_soc\":" + (isnan(cc_soc) ? String("0.0") : String(cc_soc, 1));
-  json +=
   json += ",\"soc_ekf\":" + (isnan(soc_ekf) ? String("0.0") : String(soc_ekf, 1));
   json += ",\"soh\":" + String(sohEngine.getSOH(), 1);
   json += ",\"soc_uncertainty\":" +
@@ -1536,7 +1535,7 @@ void applyConfigWrite(uint16_t cuv, uint16_t cuv_d, uint16_t cov, uint16_t cov_d
 // Reset the EKF + coulomb counter; returns the re-initialized SOC.
 float runEkfReset() {
   float V_cell = (float)cellVoltages[0] / 1000.0f;
-  float I_current = (float)bmsCurrent / 10000.0f;
+  float I_current = (float)bmsCurrent / 1000.0f;  // bmsCurrent is mA -> A (matches every other conversion site)
   float soc_est = smartSOCInit(V_cell, I_current);
   initial_ekf_soc = soc_est;
   software_charge_Ah = 0.0f;

@@ -337,7 +337,7 @@ function SnapshotView({ snapshot, snapAge, onRefresh }) {
             <Stat label="Pack V" value={`${((s.vPack ?? 0) / 1000).toFixed(2)} V`} />
             <Stat label="Current" value={`${((s.current ?? 0) / 1000).toFixed(2)} A`} />
             <Stat label="Power mode" value={PWR_MODES[s.pwr] ?? s.pwr} />
-            <Stat label="Bal mode" value={s.balMode === 1 ? 'Host' : 'Auto'} />
+            <Stat label="Bal mode" value={['Auto', 'Host', 'Manual'][s.balMode] ?? s.balMode} />
             <Stat label="Bal master" value={s.balMaster ? 'On' : 'Off'} />
             <Stat label="FET enable" value={s.fetEn ? 'TEST' : 'AUTO'} />
             <Stat label="SS A/B/C" value={`${s.ssA}/${s.ssB}/${s.ssC}`} />

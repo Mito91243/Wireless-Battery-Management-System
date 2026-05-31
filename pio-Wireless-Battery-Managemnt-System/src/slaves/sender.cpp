@@ -84,62 +84,6 @@ void readCCData(int &cc3, int &cc1) {
   }
 }
 
-// ---------------------------------------------------------
-// readPASSQ — Direct DASTATUS6 (0x0076) reader.
-// Byte order: bytes 0-3 = integer userAh, bytes 4-7 = fractional userAh,
-//             bytes 8-11 = accumulated time (seconds).
-// Returns accumulated charge in userAh (1 userAh = 1 mAh for USER_AMPS=1mA).
-// ---------------------------------------------------------
-float readPASSQ(uint32_t &accumTime) {
-  // 1. Trigger DASTATUS6 subcommand (0x0076)
-  Wire.beginTransmission(0x08);
-  Wire.write(0x3E);       // Subcommand Register
-  Wire.write(0x76);       // Lower byte of 0x0076
-  Wire.write(0x00);       // Upper byte of 0x0076
-  Wire.endTransmission();
-
-  delayMicroseconds(1000); // Wait for MAC engine
-
-  // 2. Read 12 bytes from buffer starting at 0x40
-  Wire.beginTransmission(0x08);
-  Wire.write(0x40);
-  Wire.endTransmission(false);
-
-  Wire.requestFrom((int)0x08, 12);
-  if (Wire.available() >= 12) {
-    uint8_t buf[12];
-    for (int i = 0; i < 12; i++) buf[i] = Wire.read();
-
-    // Bytes 0-3 = integer userAh (I4, signed 32-bit)
-    int32_t intRaw = ((int32_t)buf[3] << 24) |
-                     ((int32_t)buf[2] << 16) |
-                     ((int32_t)buf[1] << 8)  |
-                     buf[0];
-
-    // Bytes 4-7 = fractional userAh (U4, unsigned 32-bit)
-    uint32_t fracRaw = ((uint32_t)buf[7] << 24) |
-                       ((uint32_t)buf[6] << 16) |
-                       ((uint32_t)buf[5] << 8)  |
-                       buf[4];
-
-    // Bytes 8-11 = accumulated time in seconds
-    accumTime = ((uint32_t)buf[11] << 24) |
-                ((uint32_t)buf[10] << 16) |
-                ((uint32_t)buf[9] << 8)   |
-                buf[8];
-
-    // Combine: fractional portion is fracRaw / 2^32
-    // After RESET_PASSQ, fractional is initialized to 0.5 userAh (silicon quirk)
-    float frac = (float)fracRaw / 4294967296.0f; // 2^32
-    frac -= 0.5f; // Compensate for the 0.5 init value
-
-    return (float)intRaw + frac;
-  }
-
-  accumTime = 0;
-  return 0.0f;
-}
-
 // ==================== CACHED BMS DATA ====================
 unsigned int cellVoltages[16];
 unsigned int vStack = 0;
@@ -169,7 +113,6 @@ bool ledState = false;
 bq_protection_t protStatus;
 bq_temperature_t tempStatus;
 uint16_t balancingMask = 0;
-uint16_t hwBalancingMask = 0; // True hardware state
 uint16_t hostBalTriggerMv = 3400;
 uint16_t hostBalDeltaMv = 5;
 uint16_t lastFetStat = 0; // Cached FET_Status register (0x7F) for API access
@@ -199,9 +142,6 @@ uint8_t pendingPwrMode =
 bool autoSleepEnabled = false; // Tracks Power Config (0x9234) Bit 0
 unsigned long pwrCommandTime = 0;
 
-const uint32_t READ_INTERVAL_MS =
-    5000; // Increased interval drastically as a fallback only (Interrupts
-          // handle normal flow)
 unsigned long lastRead = 0;
 uint32_t txCount = 0;
 
@@ -209,8 +149,6 @@ uint32_t txCount = 0;
 bool isHardwareBalancing = false;
 uint32_t cellBalancingTimes[16] = {0};
 uint16_t totalBalancingTime = 0;
-uint16_t hwBalancingTime = 0; // Direct read from BQ76952 CB Active Time
-                              // (0x0085) — evidence of real HW balancing
 uint16_t cellBalancingDelta = 0;
 uint16_t minCellV = 0;
 uint16_t maxCellV = 0;
@@ -227,7 +165,6 @@ float soc_uncertainty = 0.0f;
 float voltage_error_ekf = 0.0f;
 float initial_ekf_soc = -1.0f;   // Stores the boot SOC from the EKF
 float software_charge_Ah = 0.0f; // Accurate CC integration
-unsigned long last_cc_update = 0;
 unsigned long last_cc_reset_time = 0; // Hardware Coulomb Counter reset guard
 unsigned long lastEKFUpdate = 0;
 const unsigned long EKF_UPDATE_INTERVAL = 1000; // 1 second update (was 10s)
@@ -816,7 +753,6 @@ void hostBalancingLoop() {
     Serial.printf("[HOST-BAL-VERIFY] Hardware physically reports mask: 0x%04X\n", hardwareConfirmation);
     
     // SYNC WITH WEB DASHBOARD (The API depends on these)
-    hwBalancingMask = hardwareConfirmation;
     isHardwareBalancing = (hardwareConfirmation != 0);
     hostRequestedMask = mask;
     lastBalRetry = millis();

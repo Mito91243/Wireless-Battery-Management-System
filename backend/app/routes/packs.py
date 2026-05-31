@@ -40,7 +40,8 @@ _SS_B_BITS = {
 }
 _SS_C_BITS = {
     7: ("HWDF", "Hardware Diagnostic Fault"), 6: ("PTO", "Precharge Timeout"),
-    5: ("COVL", "Cell Overvoltage Latch"), 3: ("SCDL", "Short-Circuit Discharge Latch"),
+    5: ("COVL", "Cell Overvoltage Latch"), 4: ("PCHGOVR", "Pre-charge/Charge Overvoltage Latch"),
+    3: ("SCDL", "Short-Circuit Discharge Latch"),
     2: ("OCDL", "Overcurrent Discharge Latch"),
 }
 
