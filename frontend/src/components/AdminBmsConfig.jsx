@@ -57,7 +57,9 @@ export default function AdminBmsConfig({ packs = [] }) {
       const d = await apiFetch(`/v1/packs/${packId}/bms/snapshot`);
       setSnapshot(d.payload);
       setSnapAge(d.age_s);
-      if (d.age_s != null) setOnline(d.age_s < 30);
+      // Online tracks live telemetry freshness (matches the dashboard + the
+      // dispatch gate) — not the on-demand snapshot's age.
+      setOnline(!!d.online);
     } catch { /* keep the last snapshot on a transient error */ }
   }, [packId]);
 

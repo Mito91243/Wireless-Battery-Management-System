@@ -77,6 +77,11 @@ OTA_BLOB_TTL_SECONDS = int(os.getenv("OTA_BLOB_TTL_SECONDS", "300"))
 _CELL_V_EMPTY = 3.0
 _CELL_V_FULL = 4.2
 
+# Current magnitude (mA) below which the pack is treated as idle (neither
+# charging nor discharging). Mirrors the firmware's own ±10 mA threshold for
+# driving its CHG/DSG indicator LEDs (sender.cpp).
+_CURRENT_DEADBAND_MA = 10.0
+
 # Module-level client so start/stop can manage a single instance.
 _client: Optional[mqtt.Client] = None
 _client_lock = threading.Lock()
@@ -125,13 +130,23 @@ def _extract_cell_voltages(payload: dict[str, Any]) -> dict[int, float]:
 
 
 def _charging_discharging_flag(payload: dict[str, Any]) -> Optional[bool]:
-    """Map firmware's split isCharging/isDischarging into a single tri-state.
+    """Tri-state power flow derived from ACTUAL current, not the BQ FET bits.
 
-    True  = charging, False = discharging, None = idle / unknown.
+    True = charging, False = discharging, None = idle / unknown.
+
+    The firmware's isCharging/isDischarging are just the CHG/DSG FET-*enabled*
+    status bits — they read true even at rest whenever the FET is on, which is why
+    a pack sitting at ~0 A reported "charging". Classify off the current sign
+    instead (negative = discharge, per the firmware convention), with the same
+    small deadband the device uses to drive its own CHG/DSG LEDs.
     """
-    if payload.get("isCharging"):
+    try:
+        current_ma = float(payload.get("current", 0))
+    except (TypeError, ValueError):
+        return None
+    if current_ma > _CURRENT_DEADBAND_MA:
         return True
-    if payload.get("isDischarging"):
+    if current_ma < -_CURRENT_DEADBAND_MA:
         return False
     return None
 
@@ -165,12 +180,19 @@ def _update_master_metadata(db: Session, pack: Pack, payload: dict[str, Any]) ->
 def _persist_reading(db: Session, pack: Pack, payload: dict[str, Any]) -> None:
     cell_voltages = _extract_cell_voltages(payload)
 
-    # Pack-level electricals
-    v_pack_mv = payload.get("vPack") or payload.get("vStack") or 0
-    try:
-        v_real = float(v_pack_mv) / 1000.0  # mV → V
-    except (TypeError, ValueError):
-        v_real = 0.0
+    # Pack voltage = the true battery (stack) voltage. Prefer the sum of the
+    # present per-cell voltages (exactly what the dashboard shows per cell), then
+    # the BQ stack register (vStack). vPack is the post-FET *terminal* pin, which
+    # reads garbage (~5 V) when the pack output isn't connected (e.g. on the
+    # bench) — so it's the last resort, not the primary as it used to be.
+    if cell_voltages:
+        v_real = sum(cell_voltages.values())
+    else:
+        v_mv = payload.get("vStack") or payload.get("vPack") or 0
+        try:
+            v_real = float(v_mv) / 1000.0  # mV → V
+        except (TypeError, ValueError):
+            v_real = 0.0
 
     try:
         current_a = float(payload.get("current", 0)) / 1000.0  # mA → A

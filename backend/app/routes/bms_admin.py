@@ -180,9 +180,18 @@ def get_bms_snapshot(
     db: Session = Depends(get_db),
 ):
     pack = _resolve_admin_pack(pack_id, db)
+    # "Online" must track live TELEMETRY freshness — the same signal the dashboard
+    # and the command-dispatch gate use — NOT the admin snapshot's age. Snapshots
+    # are on-demand, so their age routinely exceeds 30s while the pack streams
+    # fine; keying the UI off snapshot age made an online pack read "offline".
+    tele_age = _latest_reading_age(pack, db)
+    online = tele_age is not None and tele_age <= ONLINE_MAX_AGE_S
+    tele_age_out = round(tele_age, 1) if tele_age is not None else None
+
     row = db.query(BmsSnapshot).filter(BmsSnapshot.pack_id == pack.id).first()
     if row is None:
-        return {"payload": None, "age_s": None, "received_at": None}
+        return {"payload": None, "age_s": None, "received_at": None,
+                "telemetry_age_s": tele_age_out, "online": online}
     age = (datetime.utcnow() - row.received_at).total_seconds()
     try:
         payload = _json.loads(row.payload)
@@ -192,6 +201,8 @@ def get_bms_snapshot(
         "payload": payload,
         "age_s": round(age, 1),
         "received_at": row.received_at.replace(microsecond=0).isoformat() + "Z",
+        "telemetry_age_s": tele_age_out,
+        "online": online,
     }
 
 
