@@ -137,8 +137,23 @@ inline void initBQ76952() {
 
 
   // 5. FET Control & Manufacturing Init
-  Serial.println("[BMS-INIT] FET Options -> 0x0D (Autonomous)");
-  bms.writeByteToMemory(0x9308, 0x0D);
+  // ============================ BENCH TEST ONLY ============================
+  // FET Options (0x9308) bit map (TI SLUA991A Fig 2-17):
+  //   b0=SFET  b1=SLEEPCHG  b2=HOST_FET_EN  b3=FET_CTRL_EN  b4=PDSG_EN  b5=FET_INIT_OFF
+  // SFET (bit 0) is what "enables body diode protection for FETs in series": with
+  // it set, if one FET is off and current above the Body Diode Threshold flows,
+  // the device AUTO-TURNS-ON the opposite FET to protect its body diode. That is
+  // the behavior that keeps re-enabling the second MOSFET during a one-FET test.
+  // 0x0D -> 0x0C clears ONLY SFET (bit 0); HOST_FET_EN (b2) + FET_CTRL_EN (b3) stay
+  // set so host/manual FET control still works. The off FET's body diode is now
+  // UNPROTECTED — keep test current/duration limited and watch FET temperature.
+  // >>> REVERT to 0x0D for normal/production use. <<<
+  Serial.println("[BMS-INIT] FET Options -> 0x0C (BENCH: SFET/body-diode protection OFF)");
+  bms.writeByteToMemory(0x9308, 0x0C);
+  // Normal value:
+  // Serial.println("[BMS-INIT] FET Options -> 0x0D (Autonomous)");
+  // bms.writeByteToMemory(0x9308, 0x0D);
+  // =========================================================================
   delay(50);
 
   // Mfg Status Init: FET_EN=1, PF_EN=1 (survives CONFIG_UPDATE exits)
