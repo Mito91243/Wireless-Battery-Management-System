@@ -288,6 +288,12 @@ void espnowSetup() {
   g_slaveMacTail[0] = mac[3]; g_slaveMacTail[1] = mac[4]; g_slaveMacTail[2] = mac[5];
   snprintf(slaveApSsid, sizeof(slaveApSsid), "wBMS-Slave-%s", pairingCode); // unique per unit (issues C2)
   Serial.printf("[LINK] MAC %s  Pairing %s\n", WiFi.macAddress().c_str(), pairingCode);
+  // Print the master MAC we transmit to, so a stale/wrong RECEIVER_ADDRESS (sends
+  // un-ACKed -> node-down loop while still hearing the master's heartbeat) is
+  // obvious at boot. Must match the master's STA MAC for delivery to work.
+  Serial.printf("[LINK] Target master (RECEIVER_ADDRESS) %02X:%02X:%02X:%02X:%02X:%02X\n",
+                RECEIVER_ADDRESS[0], RECEIVER_ADDRESS[1], RECEIVER_ADDRESS[2],
+                RECEIVER_ADDRESS[3], RECEIVER_ADDRESS[4], RECEIVER_ADDRESS[5]);
 
   int scanned = scanForMasterChannel();
   uint8_t ch = (scanned >= 0) ? (uint8_t)scanned : (uint8_t)FALLBACK_CHANNEL;

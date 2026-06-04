@@ -30,7 +30,7 @@ bool enqueueMessage(const DeviceMessage &data, int senderIndex)
   if (queueCount >= QUEUE_SIZE)
   {
     portEXIT_CRITICAL(&queueMux);
-    Serial.println("[Queue] ⚠️ Queue full, dropping message");
+    Serial.println("[Queue] Queue full, dropping message");
     return false;
   }
   messageQueue[queueHead].data = data;
@@ -237,7 +237,7 @@ void runPortalUntilConnected()
   }
 
   wm.stopConfigPortal();
-  Serial.println("[WiFi] ✅ Connected!");
+  Serial.println("[WiFi] Connected!");
   Serial.printf("[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
 }
 
@@ -258,7 +258,7 @@ void initWiFi()
     }
     else
     {
-      Serial.println("[WiFi] ✅ Connected!");
+      Serial.println("[WiFi] Connected!");
       Serial.printf("[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
     }
   }
@@ -287,7 +287,7 @@ void openConfigPortalOnDemand()
   wm.setConfigPortalTimeout(0);     // wait until the user connects it
   if (wm.startConfigPortal("WBMS-Setup"))
   {
-    Serial.println("[WiFi] ✅ Reconfigured!");
+    Serial.println("[WiFi] Reconfigured!");
     Serial.printf("[WiFi] IP: %s\n", WiFi.localIP().toString().c_str());
     startDiscoveryAP();
   }
@@ -399,7 +399,7 @@ bool senderFleetSafeForOta(char *reason, size_t reasonSize)
 {
 #ifdef OTA_SKIP_SAFETY_CHECKS
   snprintf(reason, reasonSize, "safety checks disabled at build time");
-  Serial.println("[OTA] ⚠ OTA_SKIP_SAFETY_CHECKS active — bypassing prechecks");
+  Serial.println("[OTA] OTA_SKIP_SAFETY_CHECKS active - bypassing prechecks");
   return true;
 #else
   for (int i = 0; i < NUM_SENDERS; i++)
@@ -441,13 +441,13 @@ void performOta(const char *url, const char *version, const char *sha256)
   esp_err_t err = esp_https_ota(&httpConfig);
   if (err == ESP_OK)
   {
-    Serial.println("[OTA] ✅ Image installed, rebooting...");
+    Serial.println("[OTA] Image installed, rebooting...");
     delay(500);
     esp_restart();
   }
   else
   {
-    Serial.printf("[OTA] ❌ Upgrade failed: %s (0x%x)\n", esp_err_to_name(err), err);
+    Serial.printf("[OTA] Upgrade failed: %s (0x%x)\n", esp_err_to_name(err), err);
   }
 }
 
@@ -466,7 +466,7 @@ void handleOtaCommand(const char *json)
   if (!extractJsonString(json, "url", url, sizeof(url)) ||
       !extractJsonString(json, "version", version, sizeof(version)))
   {
-    Serial.println("[OTA] ❌ Command missing url or version");
+    Serial.println("[OTA] Command missing url or version");
     return;
   }
   extractJsonString(json, "sha256", sha256, sizeof(sha256)); // optional
@@ -737,7 +737,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
   }
   memcpy(buf, payload, length);
   buf[length] = '\0';
-  Serial.printf("[MQTT] 📨 Command on %s: %s\n", topic, buf);
+  Serial.printf("[MQTT] command on %s\n", topic);
   if (strcmp(topic, mqttCmdTopic) != 0)
     return;
 
@@ -808,15 +808,15 @@ void connectMqtt()
 
   if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD))
   {
-    Serial.println("[MQTT] ✅ Connected!");
+    Serial.println("[MQTT] Connected!");
     if (mqtt.subscribe(mqttCmdTopic))
-      Serial.printf("[MQTT] 🔔 Subscribed to %s\n", mqttCmdTopic);
+      Serial.printf("[MQTT] Subscribed to %s\n", mqttCmdTopic);
     else
-      Serial.printf("[MQTT] ✗ Subscribe to %s failed\n", mqttCmdTopic);
+      Serial.printf("[MQTT] Subscribe to %s failed\n", mqttCmdTopic);
   }
   else
   {
-    Serial.printf("[MQTT] ✗ Failed, rc=%d\n", mqtt.state());
+    Serial.printf("[MQTT] Failed, rc=%d\n", mqtt.state());
   }
 }
 
@@ -880,11 +880,11 @@ bool publishToMqtt(int senderIndex, const DeviceMessage &data, float soc)
 
   if (ok)
   {
-    Serial.printf("[MQTT] ✓ Published to %s (%d bytes)\n", MQTT_TOPIC, payload.length());
+    Serial.printf("[MQTT] published sender %d to %s (%d bytes)\n", senderIndex + 1, MQTT_TOPIC, payload.length());
   }
   else
   {
-    Serial.println("[MQTT] ✗ Publish failed");
+    Serial.println("[MQTT] publish failed");
   }
   return ok;
 }
@@ -913,7 +913,7 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len)
 
   if (len != sizeof(DeviceMessage))
   {
-    Serial.printf("[ESP-NOW] ❌ Size mismatch: %d bytes\n", len);
+    Serial.printf("[ESP-NOW] size mismatch: %d bytes\n", len);
     return;
   }
 
@@ -922,39 +922,26 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len)
   tempData.message[sizeof(tempData.message) - 1] = '\0';
 
   // Learn pairingCode -> MAC for admin command routing (message is "BMS:<6hex>").
+  char code[7] = "------";
   if (strncmp(tempData.message, "BMS:", 4) == 0)
   {
-    char code[7];
     strncpy(code, tempData.message + 4, 6);
     code[6] = '\0';
     cachePairing(code, mac_addr);
   }
 
   int senderIndex = findSenderIndex(mac_addr);
-  String senderMac = macToString(mac_addr);
-
-  Serial.printf("[ESP-NOW] 📥 Received %d bytes from %s (Sender %d)\n", len, senderMac.c_str(), senderIndex + 1);
-  Serial.printf("[ESP-NOW]   Cells: ");
-  for (int i = 0; i < CONNECTED_CELLS; i++)
-  {
-    Serial.printf("V%d=%umV ", i + 1, tempData.v[i]);
-  }
-  Serial.println();
-  Serial.printf("[ESP-NOW]   Stack=%umV Pack=%umV Current=%dmA\n", tempData.v_stack, tempData.v_pack, tempData.current);
-  Serial.printf("[ESP-NOW]   Temps: chip=%.1fC t1=%.1fC t2=%.1fC t3=%.1fC\n", tempData.chip_temp, tempData.temp1, tempData.temp2, tempData.temp3);
-  Serial.printf("[ESP-NOW]   Charge=%.1fAh Time=%us Charging=%d Discharging=%d\n", tempData.charge, tempData.charge_time, tempData.isCharging, tempData.isDischarging);
-  Serial.printf("[ESP-NOW]   Message: %s\n", tempData.message);
 
   if (senderIndex != -1)
   {
     if (enqueueMessage(tempData, senderIndex))
-    {
-      Serial.printf("[ESP-NOW] ✅ Queued data from Sender %d\n", senderIndex + 1);
-    }
+      Serial.printf("[ESP-NOW] msg received from %s (sender %d)\n", code, senderIndex + 1);
+    else
+      Serial.printf("[ESP-NOW] msg from %s dropped (queue full)\n", code);
   }
   else
   {
-    Serial.printf("[ESP-NOW] ⚠️ Unknown sender MAC: %s\n", senderMac.c_str());
+    Serial.printf("[ESP-NOW] msg from unknown slave %s\n", macToString(mac_addr).c_str());
   }
 }
 
@@ -995,7 +982,7 @@ void setup()
   // ── ESP-NOW setup ──
   if (esp_now_init() != ESP_OK)
   {
-    Serial.println("[ESP-NOW] ❌ Init Failed");
+    Serial.println("[ESP-NOW] Init Failed");
     ESP.restart();
   }
 
@@ -1010,7 +997,7 @@ void setup()
     esp_now_add_peer(&peerInfo);
   }
 
-  Serial.println("[System] ✅ Master ready (MQTT + ESP-NOW)");
+  Serial.println("[System] Master ready (MQTT + ESP-NOW)");
 }
 
 void loop()
@@ -1027,15 +1014,13 @@ void loop()
   if (otaMarkValidPending && WiFi.status() == WL_CONNECTED && mqtt.connected())
   {
     if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK)
-      Serial.println("[OTA] ✅ Marked running image valid, rollback cancelled");
+      Serial.println("[OTA] Marked running image valid, rollback cancelled");
     otaMarkValidPending = false;
   }
 
   QueuedMessage qMsg;
   if (dequeueMessage(qMsg))
   {
-    Serial.println("[Queue] Processing BMS data...");
-
     int idx = qMsg.senderIndex;
     if (idx >= 0 && idx < NUM_SENDERS)
     {
@@ -1046,6 +1031,10 @@ void loop()
 
       if (!ekfInitialized[idx])
       {
+        // The array declaration only seeds ekf[0] with EKF_SAMPLE_TIME; every
+        // other sender's EKF is default-constructed at 10s. Force the real
+        // ESP-NOW cadence here so each sender integrates over the right dt.
+        ekf[idx].setSampleTime(EKF_SAMPLE_TIME);
         // Bootstrap SoC from OCV (assumes pack is roughly at rest on first reading)
         float initSoc = ekf[idx].invertOCV_Discharge(cellV);
         ekf[idx].begin(initSoc);
@@ -1055,8 +1044,6 @@ void loop()
 
       ekf[idx].update(currentA, cellV);
       float soc = ekf[idx].getSOC();
-      Serial.printf("[EKF] Sender %d: SoC=%.1f%% (V_err=%.1fmV)\n",
-                    idx + 1, soc, ekf[idx].getVoltageError() * 1000.0f);
 
       // Refresh OTA-safety snapshot for this sender.
       senderState[idx].lastSoc = soc;
