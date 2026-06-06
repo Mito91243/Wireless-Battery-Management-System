@@ -26,18 +26,23 @@ portMUX_TYPE queueMux = portMUX_INITIALIZER_UNLOCKED;
 
 bool enqueueMessage(const DeviceMessage &data, int senderIndex)
 {
+  bool droppedOldest = false;
   portENTER_CRITICAL(&queueMux);
   if (queueCount >= QUEUE_SIZE)
   {
-    portEXIT_CRITICAL(&queueMux);
-    Serial.println("[Queue] Queue full, dropping message");
-    return false;
+    // Queue full: drop the OLDEST reading (advance tail) so we always keep the
+    // freshest data. A live feed must never show a stale backlog.
+    queueTail = (queueTail + 1) % QUEUE_SIZE;
+    queueCount--;
+    droppedOldest = true;
   }
   messageQueue[queueHead].data = data;
   messageQueue[queueHead].senderIndex = senderIndex;
   queueHead = (queueHead + 1) % QUEUE_SIZE;
   queueCount++;
   portEXIT_CRITICAL(&queueMux);
+  if (droppedOldest)
+    Serial.println("[Queue] Full: dropped oldest to keep the freshest reading");
   return true;
 }
 
@@ -1026,7 +1031,7 @@ void loop()
   }
 
   QueuedMessage qMsg;
-  if (dequeueMessage(qMsg))
+  while (dequeueMessage(qMsg))   // drain the whole queue each loop so nothing waits
   {
     int idx = qMsg.senderIndex;
     if (idx >= 0 && idx < NUM_SENDERS)

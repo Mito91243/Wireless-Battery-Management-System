@@ -66,11 +66,11 @@ const uint8_t WBMS_ESPNOW_LMK[16] = {
 // uses MB_AP_PASSWORD (tb_config.h); there is no fixed fallback SSID constant.
 const int FALLBACK_CHANNEL = 1;   // used only until the master's channel is learned
 const int FAILURE_THRESHOLD = 10; // consecutive ESP-NOW send failures before fallback AP starts
-const uint32_t SEND_INTERVAL_MS = 500;
+const uint32_t SEND_INTERVAL_MS = 2000;   // 0.5 Hz uplink (lowered from 500ms to stop the master's queue backing up)
 
 // ==================== MASTER CONFIG ====================
 #define QUEUE_SIZE 10
-const float EKF_SAMPLE_TIME = 0.5f; // Must match SEND_INTERVAL_MS / 1000
+const float EKF_SAMPLE_TIME = 2.0f; // Must match SEND_INTERVAL_MS / 1000
 
 // ==================== DATA STRUCTURE ====================
 typedef struct

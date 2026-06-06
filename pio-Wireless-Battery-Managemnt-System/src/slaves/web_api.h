@@ -255,6 +255,30 @@ button:hover{filter:brightness(0.95)}
     </div>
   </div>
   <div class="card">
+    <div class="card-head" style="display:flex; justify-content:space-between; align-items:center;">
+      <div><h2>DCIR Measurement</h2><div class="desc">Internal resistance per cell (load-step, SOC 25-65%)</div></div>
+      <button onclick="downloadDcirLog()" style="padding:4px 10px;font-size:10px;font-weight:600;border:1px solid #e0e3e8;border-radius:4px;background:#fff;color:#5f6672;cursor:pointer;">&#x2B07; CSV</button>
+    </div>
+    <div class="card-body">
+      <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+        <div class="cell-box" style="flex:1;min-width:90px"><div class="cell-label">STATUS</div><div class="cell-val" id="dcirState" style="font-size:14px;color:#9ca3ae">IDLE</div></div>
+        <div class="cell-box" style="flex:1;min-width:90px"><div class="cell-label">AVG DCIR</div><div class="cell-val" id="dcirAvg" style="color:#7c3aed">--<span class="cell-unit">m&Omega;</span></div></div>
+        <div class="cell-box" style="flex:1;min-width:90px"><div class="cell-label">&Delta;I</div><div class="cell-val" id="dcirDI">--<span class="cell-unit">mA</span></div></div>
+        <div class="cell-box" style="flex:1;min-width:90px"><div class="cell-label">SOC@TEST</div><div class="cell-val" id="dcirSoc">--<span class="cell-unit">%</span></div></div>
+        <div class="cell-box" style="flex:1;min-width:90px"><div class="cell-label">COUNT</div><div class="cell-val" id="dcirCnt">0</div></div>
+      </div>
+      <div class="cell-label" style="margin-bottom:4px">PER-CELL DCIR (m&Omega;/cell, green &lt;30, yellow 30-35, red &gt;35)</div>
+      <div class="g4" style="gap:6px" id="dcirGrid"></div>
+      <div id="dcirHistBox" style="margin-top:12px;display:none">
+        <div class="cell-label" style="margin-bottom:4px">MEASUREMENT HISTORY (auto-recorded)</div>
+        <table style="width:100%;border-collapse:collapse;font-size:10px;border:1px solid #e0e3e8">
+          <thead><tr style="background:#f7f8fa;color:#9ca3ae"><th style="padding:2px 4px;border:1px solid #e0e3e8">#</th><th style="padding:2px 4px;border:1px solid #e0e3e8">Time</th><th style="padding:2px 4px;border:1px solid #e0e3e8">SOC</th><th style="padding:2px 4px;border:1px solid #e0e3e8">&Delta;I</th><th style="padding:2px 4px;border:1px solid #e0e3e8">Avg m&Omega;</th></tr></thead>
+          <tbody id="dcirHistTb"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="card">
     <div class="card-head"><h2>BQ76952 Status</h2><div class="desc">Device sealing and power management</div></div>
     <div class="card-body">
       <div class="g2" style="margin-bottom:12px">
@@ -589,6 +613,7 @@ function updateUI(d){
     addF('SCD', d.prot_sc); addF('OCD2', d.prot_oc2); addF('OCD1', d.prot_oc1); addF('OCC', d.prot_occ);
     addF('COV', d.prot_ov); addF('CUV', d.prot_uv);
     addF('OTF', d.temp_otf); addF('OTINT', d.temp_oti); addF('OTD', d.temp_otd); addF('OTC', d.temp_otc);
+    addF('WIRE', d.ssC & 0x80);
     if (fHtml === '') fHtml = '<span class="badge badge-green">ALL CLEAR</span>';
     pf.innerHTML = fHtml;
   }
@@ -832,6 +857,7 @@ function updateUI(d){
   for(let i=0;i<CELLS;i++){vHist[i].push(volts[i]);if(vHist[i].length>HMAX)vHist[i].shift();}
   curHist.push(cur);if(curHist.length>HMAX)curHist.shift();
   tHist[0].push(d.temp1);tHist[1].push(d.temp2);tHist[2].push(d.temp3);for(let i=0;i<3;i++){if(tHist[i].length>HMAX)tHist[i].shift();}
+  updateDCIRUI(d);
   } catch(e) { 
     console.error("UI Update Error:", e);
   }
@@ -1087,6 +1113,62 @@ function drawCharts(){
   drawChart('chartCurrent','Pack Current (mA)',[{label:'Current',color:'#ea580c',data:curHist,dec:1}],160);
   drawChart('chartTemp','Temperatures (\u00B0C)',[{label:'TS1',color:'#dc2626',data:tHist[0]||[],dec:1},{label:'TS2',color:'#7c3aed',data:tHist[1]||[],dec:1},{label:'TS3',color:'#0891b2',data:tHist[2]||[],dec:1}],160);
 }
+// ==================== DCIR UI ====================
+const dG=document.getElementById('dcirGrid');
+for(let i=0;i<CELLS;i++) dG.innerHTML+='<div class="cell-box" style="text-align:center;padding:4px 6px" id="dC'+i+'"><div class="cell-label">C'+(i+1)+'</div><div style="font-size:14px;font-weight:700" id="dV'+i+'">--</div></div>';
+let dcirLog=[];
+function updateDCIRUI(d){
+  if(d.dcir_st===undefined)return;
+  const sn=['IDLE','ARMED','SETTLING','COOLDOWN'];
+  const sc=['#9ca3ae','#d97706','#2563eb','#16a34a'];
+  const el=document.getElementById('dcirState');
+  if(el){el.textContent=sn[d.dcir_st];el.style.color=sc[d.dcir_st];}
+  document.getElementById('dcirCnt').textContent=d.dcir_n||'0';
+  if(d.dcir_ok){
+    document.getElementById('dcirAvg').innerHTML=d.dcir_avg.toFixed(1)+'<span class="cell-unit">mΩ</span>';
+    document.getElementById('dcirDI').innerHTML=d.dcir_dI.toFixed(0)+'<span class="cell-unit">mA</span>';
+    document.getElementById('dcirSoc').innerHTML=d.dcir_soc.toFixed(1)+'<span class="cell-unit">%</span>';
+    const c=d.dcir_c||[];
+    for(let i=0;i<CELLS;i++){
+      const e=document.getElementById('dV'+i);
+      if(e&&c[i]!==undefined){
+        e.textContent=c[i].toFixed(1);
+        e.style.color=c[i]>35?'#dc2626':c[i]>30?'#d97706':'#16a34a';
+      }
+    }
+    if(d.dcir_n>dcirLog.length){
+      dcirLog.push({t:new Date().toLocaleTimeString(),soc:d.dcir_soc,dI:d.dcir_dI,avg:d.dcir_avg,c:c.slice(0,CELLS)});
+      const hB=document.getElementById('dcirHistBox'),hT=document.getElementById('dcirHistTb');
+      if(hB&&hT){
+        hB.style.display='block';
+        let h='';
+        dcirLog.forEach((r,i)=>{
+          h+='<tr><td style="padding:2px 4px;border:1px solid #e0e3e8">'+(i+1)+'</td>';
+          h+='<td style="padding:2px 4px;border:1px solid #e0e3e8">'+r.t+'</td>';
+          h+='<td style="padding:2px 4px;border:1px solid #e0e3e8">'+r.soc.toFixed(1)+'</td>';
+          h+='<td style="padding:2px 4px;border:1px solid #e0e3e8">'+r.dI.toFixed(0)+'</td>';
+          h+='<td style="padding:2px 4px;border:1px solid #e0e3e8;font-weight:700;color:#7c3aed">'+r.avg.toFixed(2)+'</td></tr>';
+        });
+        hT.innerHTML=h;
+      }
+    }
+  }
+}
+function downloadDcirLog(){
+  if(!dcirLog.length){alert('No DCIR data yet.');return;}
+  let csv='#,Time,SOC_%,Delta_I_mA,Avg_mOhm';
+  for(let i=1;i<=CELLS;i++) csv+=',Cell_'+i+'_mOhm';
+  csv+='\n';
+  dcirLog.forEach((r,i)=>{
+    csv+=(i+1)+','+r.t+','+r.soc.toFixed(1)+','+r.dI.toFixed(0)+','+r.avg.toFixed(2);
+    r.c.forEach(v=>csv+=','+v.toFixed(2));
+    csv+='\n';
+  });
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+  a.download='dcir_'+new Date().toISOString().slice(0,19).replace(/:/g,'-')+'.csv';
+  a.click();
+}
 setInterval(()=>{fetchData();fetchLog();},1000);setInterval(drawCharts,1000);fetchData();
 </script>
 </body>
@@ -1250,6 +1332,20 @@ void handleApiData() {
   json += ",\"cfg_protA\":" + String(hw_cfg_protA);
   json += ",\"cfg_protB\":" + String(hw_cfg_protB);
 
+  // DCIR Measurement
+  json += ",\"dcir_st\":" + String((int)dcirState);
+  json += ",\"dcir_ok\":" + String(dcir_valid ? 1 : 0);
+  json += ",\"dcir_avg\":" + String(dcir_avg_mOhm, 2);
+  json += ",\"dcir_dI\":" + String(dcir_delta_I_mA, 0);
+  json += ",\"dcir_soc\":" + String(dcir_soc_at_test, 1);
+  json += ",\"dcir_n\":" + String(dcir_measurement_count);
+  json += ",\"dcir_c\":[";
+  for (int i = 0; i < 16; i++) {
+    json += String(dcir_results_mOhm[i], 2);
+    if (i < 15) json += ",";
+  }
+  json += "]";
+
   json += "}";
 
   // DEBUG: Length only (full JSON print overflows UART buffer)
@@ -1303,7 +1399,6 @@ CmdRc runDeviceCommand(const char *action, uint16_t arg0, uint16_t arg1,
     Serial.println("=== CHG ON REQUEST ===");
     bms.CommandOnlysubCommand(0x001D);
     delay(20);
-    if (MB_PIN_CFETOFF >= 0) digitalWrite(MB_PIN_CFETOFF, LOW);
     uint16_t stat = 0;
     for (int i = 0; i < 5; i++) { delay(20); stat = bms.directCommandRead(0x7F); if ((stat & 0x01) != 0) break; }
     isCharging = (stat & 0x01) != 0;
@@ -1312,7 +1407,6 @@ CmdRc runDeviceCommand(const char *action, uint16_t arg0, uint16_t arg1,
 
   } else if (strcmp(action, "chgOff") == 0) {
     Serial.println("=== CHG OFF REQUEST ===");
-    if (MB_PIN_CFETOFF >= 0) digitalWrite(MB_PIN_CFETOFF, HIGH);
     delay(50);
     uint16_t stat = bms.directCommandRead(0x7F);
     isCharging = (stat & 0x01) != 0;
@@ -1322,7 +1416,6 @@ CmdRc runDeviceCommand(const char *action, uint16_t arg0, uint16_t arg1,
     Serial.println("=== DSG ON REQUEST ===");
     bms.CommandOnlysubCommand(0x001D);
     delay(20);
-    if (MB_PIN_DFETOFF >= 0) digitalWrite(MB_PIN_DFETOFF, LOW);
     uint16_t stat = 0;
     for (int i = 0; i < 5; i++) { delay(20); stat = bms.directCommandRead(0x7F); if ((stat & 0x04) != 0) break; }
     isDischarging = (stat & 0x04) != 0;
@@ -1331,7 +1424,6 @@ CmdRc runDeviceCommand(const char *action, uint16_t arg0, uint16_t arg1,
 
   } else if (strcmp(action, "dsgOff") == 0) {
     Serial.println("=== DSG OFF REQUEST ===");
-    if (MB_PIN_DFETOFF >= 0) digitalWrite(MB_PIN_DFETOFF, HIGH);
     delay(50);
     uint16_t stat = bms.directCommandRead(0x7F);
     isDischarging = (stat & 0x04) != 0;
@@ -1341,8 +1433,6 @@ CmdRc runDeviceCommand(const char *action, uint16_t arg0, uint16_t arg1,
     Serial.println("=== ALL FETS ON (EXIT MAINTENANCE) ===");
     bms.CommandOnlysubCommand(0x001D);
     delay(20);
-    if (MB_PIN_CFETOFF >= 0) digitalWrite(MB_PIN_CFETOFF, LOW);
-    if (MB_PIN_DFETOFF >= 0) digitalWrite(MB_PIN_DFETOFF, LOW);
     delay(100);
     uint16_t stat = bms.directCommandRead(0x7F);
     isCharging = (stat & 0x01) != 0;
@@ -1358,8 +1448,7 @@ CmdRc runDeviceCommand(const char *action, uint16_t arg0, uint16_t arg1,
 
   } else if (strcmp(action, "allFetsOff") == 0) {
     Serial.println("=== ALL FETS OFF (ENTER MAINTENANCE) ===");
-    if (MB_PIN_CFETOFF >= 0) digitalWrite(MB_PIN_CFETOFF, HIGH);
-    if (MB_PIN_DFETOFF >= 0) digitalWrite(MB_PIN_DFETOFF, HIGH);
+    bms.CommandOnlysubCommand(0x0095);  // ALL_FETS_OFF subcommand (was missing; button did nothing)
     delay(100);
     uint16_t stat = bms.directCommandRead(0x7F);
     isCharging = (stat & 0x01) != 0;

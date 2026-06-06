@@ -131,6 +131,39 @@ unsigned int ldPinVoltage = 0;  // Direct Command 0x38 (LD Pin)
 uint8_t powerMode = 0;          // 0=Active, 1=Sleep, 2=DeepSleep, 3=Shutdown
 float g_soh_pct = 100.0f;        // Latest SOH (%) from sohEngine, mirrored for ESP-NOW uplink
 
+// ==================== DCIR MEASUREMENT ====================
+enum DcirState { DCIR_IDLE, DCIR_ARMED, DCIR_CAPTURE, DCIR_COOLDOWN };
+DcirState dcirState = DCIR_IDLE;
+unsigned long dcirStateTime = 0;
+unsigned long dcirBaselineTime = 0;
+
+// Snapshots: "before" and "after" the current step
+unsigned int dcir_before_V[16] = {0};  // Cell voltages before load (mV)
+int          dcir_before_I     = 0;    // Pack current before load (mA, from cc1_raw)
+unsigned int dcir_after_V[16]  = {0};  // Cell voltages after load (mV)
+int          dcir_after_I      = 0;    // Pack current after load (mA)
+
+// Results computed from snapshots
+float dcir_results_mOhm[16] = {0};    // Per-cell DCIR in mOhm (already x3 for 3P correction)
+float dcir_avg_mOhm         = 0.0f;   // Average across all valid cells
+float dcir_delta_I_mA       = 0.0f;   // The |dI| that triggered the measurement
+float dcir_soc_at_test      = 0.0f;   // EKF SOC when the measurement was taken
+bool  dcir_valid            = false;  // True if >= 10 cells gave sane readings
+uint8_t dcir_measurement_count = 0;   // Total measurements since boot
+
+// History ring buffer (last 10 measurements)
+#define DCIR_HIST_MAX 10
+struct DcirRecord {
+  unsigned long timestamp_ms;
+  float soc;
+  float delta_I_mA;
+  float avg_mOhm;
+  float cells_mOhm[16];
+};
+DcirRecord dcirHistory[DCIR_HIST_MAX];
+uint8_t dcirHistHead = 0;
+uint8_t dcirHistCount = 0;
+
 // Fault Snapshot Variables
 bool snapshotTaken = false;
 float snapVoltages[16] = {0};
@@ -779,6 +812,124 @@ void hostBalancingLoop() {
 // `server` declared above, so it must be included after them).
 #include "espnow_link.h"
 
+// ==================== DCIR STATE MACHINE ====================
+// Non-blocking load-step internal-resistance measurement. Runs every loop().
+void updateDCIR() {
+  const int           DCIR_CURRENT_THRESHOLD = 2000;   // mA: minimum |dI| to trigger
+  const unsigned long DCIR_SETTLE_MS         = 1000;   // 1s settling time
+  const unsigned long DCIR_COOLDOWN_MS       = 30000;  // 30s cooldown between measurements
+  const float         DCIR_SOC_MIN           = 25.0f;  // Don't measure below this SOC
+  const float         DCIR_SOC_MAX           = 65.0f;  // Don't measure above this SOC
+
+  switch (dcirState) {
+
+    case DCIR_IDLE: {
+      // Continuously refresh the "before" baseline every 500ms (always recording).
+      if (millis() - dcirBaselineTime >= 500) {
+        dcirBaselineTime = millis();
+        for (int i = 0; i < MB_CONNECTED_CELLS; i++)
+          dcir_before_V[i] = cellVoltages[i];
+        dcir_before_I = cc1_raw; // CC1 = low-noise, high-precision current
+      }
+
+      // SOC gate: only measure in the 25-65% sweet spot.
+      if (soc_ekf < DCIR_SOC_MIN || soc_ekf > DCIR_SOC_MAX) break;
+
+      // Detect a current step (charger plug/unplug, load connect/disconnect).
+      int delta = abs(cc1_raw - dcir_before_I);
+      if (delta > DCIR_CURRENT_THRESHOLD) {
+        dcirState = DCIR_ARMED;
+        dcirStateTime = millis();
+        dcir_soc_at_test = soc_ekf;
+        Serial.printf("[DCIR] ARMED! Current step: dI=%d mA, SOC=%.1f%%\n",
+                      delta, soc_ekf);
+      }
+      break;
+    }
+
+    case DCIR_ARMED: {
+      // Wait for the voltage to settle under the new load.
+      if (millis() - dcirStateTime >= DCIR_SETTLE_MS) {
+        dcirState = DCIR_CAPTURE;
+        Serial.println("[DCIR] Settling complete. Capturing snapshot...");
+      }
+      break;
+    }
+
+    case DCIR_CAPTURE: {
+      for (int i = 0; i < MB_CONNECTED_CELLS; i++)
+        dcir_after_V[i] = cellVoltages[i];
+      dcir_after_I = cc1_raw;
+
+      float deltaI = (float)abs(dcir_after_I - dcir_before_I);
+      dcir_delta_I_mA = deltaI;
+
+      // Abort if the current step disappeared during settling.
+      if (deltaI < 500.0f) {
+        Serial.println("[DCIR] ABORTED: Current step vanished during settling.");
+        dcirState = DCIR_COOLDOWN;
+        dcirStateTime = millis();
+        break;
+      }
+
+      float sum = 0.0f;
+      int   valid_count = 0;
+
+      Serial.println("[DCIR] ========== MEASUREMENT COMPLETE ==========");
+      Serial.printf("[DCIR] dI = %.0f mA  |  SOC = %.1f%%\n", deltaI, dcir_soc_at_test);
+      Serial.printf("[DCIR] %-6s %-10s %-10s %-10s %-12s\n",
+                    "Cell", "V_before", "V_after", "dV(mV)", "R_cell(mOhm)");
+      Serial.println("[DCIR] --------------------------------------------------");
+
+      for (int i = 0; i < MB_CONNECTED_CELLS; i++) {
+        float dV = (float)dcir_before_V[i] - (float)dcir_after_V[i]; // mV
+        float R_group = (fabsf(dV) / deltaI) * 1000.0f; // mOhm (group of 3P)
+        float R_cell  = R_group * 3.0f;                 // x3 = single cell
+        dcir_results_mOhm[i] = R_cell;
+
+        Serial.printf("[DCIR] C%-5d %-10u %-10u %+-10.1f %-12.2f\n",
+                      i + 1, dcir_before_V[i], dcir_after_V[i], dV, R_cell);
+
+        if (R_cell > 1.0f && R_cell < 200.0f) {
+          sum += R_cell;
+          valid_count++;
+        }
+      }
+
+      dcir_avg_mOhm = (valid_count > 0) ? (sum / valid_count) : 0.0f;
+      dcir_valid = (valid_count >= 10); // At least 10 of 13 cells must be valid
+      dcir_measurement_count++;
+
+      Serial.println("[DCIR] --------------------------------------------------");
+      Serial.printf("[DCIR] AVERAGE: %.2f mOhm/cell (%d valid cells)\n",
+                    dcir_avg_mOhm, valid_count);
+      Serial.println("[DCIR] ==========================================");
+
+      // Save to the circular history buffer.
+      DcirRecord &rec = dcirHistory[dcirHistHead];
+      rec.timestamp_ms = millis();
+      rec.soc = dcir_soc_at_test;
+      rec.delta_I_mA = deltaI;
+      rec.avg_mOhm = dcir_avg_mOhm;
+      for (int i = 0; i < 16; i++) rec.cells_mOhm[i] = dcir_results_mOhm[i];
+      dcirHistHead = (dcirHistHead + 1) % DCIR_HIST_MAX;
+      if (dcirHistCount < DCIR_HIST_MAX) dcirHistCount++;
+
+      dcirState = DCIR_COOLDOWN;
+      dcirStateTime = millis();
+      break;
+    }
+
+    case DCIR_COOLDOWN: {
+      if (millis() - dcirStateTime >= DCIR_COOLDOWN_MS) {
+        dcirState = DCIR_IDLE;
+        Serial.println("[DCIR] Cooldown complete. Ready for next measurement.");
+      }
+      break;
+    }
+  }
+}
+
 // ==================== SETUP ====================
 
 void setup() {
@@ -1024,6 +1175,9 @@ void loop() {
   uint32_t tLink = micros();
   espnowLoop();
   accum_web_us += (micros() - tLink);
+
+  // DCIR state machine (non-blocking, runs every loop iteration)
+  updateDCIR();
 
   delay(2);
 }

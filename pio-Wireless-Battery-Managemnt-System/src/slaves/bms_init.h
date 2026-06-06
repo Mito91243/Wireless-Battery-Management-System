@@ -97,41 +97,68 @@ inline void initBQ76952() {
   bms.writeByteToMemory(0x9287, scd_d);                     // SCD Delay
   delay(50);
 
-  // 4.1 Enable V/I protections, DISABLE temperature protections
-  bms.writeByteToMemory(0x9261, 0xFC); // Protections_A
-  bms.writeByteToMemory(0x9262, 0x00); // Protections_B (temp OFF)
-  bms.writeByteToMemory(0x9263, 0x00); // Protections_C
+  // 4.1 Enable ALL protections: V/I + Temperature + Open Wire
+  //   Prot A (0x9261): 0xFC = COV, CUV, OCC, OCD1, OCD2, SCD  (unchanged)
+  //   Prot B (0x9262): 0xB0 = OTF(b7) + OTD(b5) + OTC(b4)     (NEW: temp ON)
+  //   Prot C (0x9263): 0x80 = HWDF(b7) = Open Wire detection  (NEW)
+  bms.writeByteToMemory(0x9261, 0xFC); // Protections_A: V/I protections
+  bms.writeByteToMemory(0x9262, 0xB0); // Protections_B: OTF + OTD + OTC
+  bms.writeByteToMemory(0x9263, 0x80); // Protections_C: HWDF (Open Wire)
   delay(50);
 
+  // 4.1.1 Temperature Protection Thresholds (I1 signed byte, degrees C directly)
+  //   OTC=50C opens CHG FET, OTD=60C opens DSG FET, OTF=80C opens ALL FETs.
+  //   Cell thermistors (TS1/TS3/HDQ) feed OTC/OTD; CFETOFF feeds OTF.
+  bms.writeByteToMemory(0x929A, 50);   // OTC Threshold = 50C
+  bms.writeByteToMemory(0x929B, 5);    // OTC Delay = 5s
+  bms.writeByteToMemory(0x929D, 60);   // OTD Threshold = 60C
+  bms.writeByteToMemory(0x929E, 5);    // OTD Delay = 5s
+  bms.writeByteToMemory(0x92A0, 80);   // OTF Threshold = 80C
+  bms.writeByteToMemory(0x92A1, 5);    // OTF Delay = 5s
+  delay(50);
+  Serial.println("[BMS-INIT] Temp protections ENABLED: OTC=50C, OTD=60C, OTF=80C (5s delay each)");
+  Serial.println("[BMS-INIT] Open Wire detection ENABLED (HWDF in Prot_C)");
+
   // 4.2 Permanent Failure & Autonomous Recovery Configuration (SLAVE BOARD PREP)
-  Serial.println("[BMS-INIT] Configuring PF and Recovery Logic (TOSF, Charger, LD)");
+  Serial.println("[BMS-INIT] Configuring PF and Recovery Logic (TOSF, LD)");
   
   // TOSF: Top of Stack Fault (3V threshold, 5s delay)
   bms.writeByteToMemory(0x92C3, 0x01); // Settings:Permanent Failure:Enabled PF D[TOSF]
   bms.writeIntToMemory(0x92D1, 300);   // Permanent Fail:TOS:Threshold = 3V (300 * 10mV units)
   bms.writeByteToMemory(0x92D2, 5);     // Permanent Fail:TOS:Delay = 5s
 
-  // Charger Detection (Recovery from CUV)
-  bms.writeByteToMemory(0x929F, 50);    // Settings:Protection:Recovery:Charger Detect = 500mV (50 * 10mV)
+  // Charger detection is automatic BQ76952 hardware (PACK pin); no register write needed.
+  // (Old code wrote 0x929F here, which is actually OTD Recovery, not charger detect. Removed.)
   
-  // Load Detect (Autonomous recovery from SCD/OCD)
-  bms.writeByteToMemory(0x92A0, 2);     // Protections:Load Detect:Timeout = 2 seconds
+  // Load Detect (Autonomous recovery from SCD/OCD latch faults)
+  // CORRECTED ADDRESS: old code wrote 0x92A0, which is OTF Threshold. The real
+  // LD Active Time register is 0x92B4 (0x92B5/0x92B6 left at defaults).
+  bms.writeByteToMemory(0x92B4, 2);     // LD Active Time = 2 seconds (enables LD recovery)
   
   // Pre-Charge (PCHG) Logic
   bms.writeIntToMemory(0x930B, 2500);   // Settings:Protection:Precharge Start Voltage = 2.5V
   bms.writeIntToMemory(0x930D, 3000);   // Settings:Protection:Precharge Stop Voltage = 3.0V
   
-  // ----- TEST: READ THE DEFAULTS TO VERIFY ADDRESSES -----
+  // ----- READBACK VERIFICATION -----
+  // readDataMemory() returns a SHARED buffer that is overwritten on every call,
+  // so copy each value out IMMEDIATELY after its read, before the next read.
   byte* pfEnD = bms.readDataMemory(0x92C3);
-  uint8_t pfEnD_val = pfEnD ? pfEnD[0] : 0xFF;
-  byte* tosThresh = bms.readDataMemory(0x92D1);
-  int tosThresh_val = tosThresh ? tosThresh[0] : -1;
-  byte* tosDelay = bms.readDataMemory(0x92D2);
-  int tosDelay_val = tosDelay ? tosDelay[0] : -1;
+  int pfEnD_val = pfEnD ? pfEnD[0] : 0xFF;
+  byte* protB = bms.readDataMemory(0x9262);
+  int protB_val = protB ? protB[0] : 0xFF;
+  byte* protC = bms.readDataMemory(0x9263);
+  int protC_val = protC ? protC[0] : 0xFF;
+  byte* otcT = bms.readDataMemory(0x929A);
+  int otc_val = otcT ? (int8_t)otcT[0] : -99;
+  byte* otdT = bms.readDataMemory(0x929D);
+  int otd_val = otdT ? (int8_t)otdT[0] : -99;
+  byte* otfT = bms.readDataMemory(0x92A0);
+  int otf_val = otfT ? (int8_t)otfT[0] : -99;
   
-  Serial.printf("[BMS-INIT] TEST READ -> Enabled PF D (0x92C3) expected 0x00: 0x%02X\n", pfEnD_val);
-  Serial.printf("[BMS-INIT] TEST READ -> PF TOS Thresh (0x92D1) expected ~100: %d\n", tosThresh_val);
-  Serial.printf("[BMS-INIT] TEST READ -> PF TOS Delay (0x92D2) expected ~5: %d\n", tosDelay_val);
+  Serial.printf("[BMS-INIT] PF Enabled D (0x92C3): 0x%02X (expect 0x01)\n", pfEnD_val);
+  Serial.printf("[BMS-INIT] Prot B (0x9262): 0x%02X (expect 0xB0)\n", protB_val);
+  Serial.printf("[BMS-INIT] Prot C (0x9263): 0x%02X (expect 0x80)\n", protC_val);
+  Serial.printf("[BMS-INIT] OTC=%dC OTD=%dC OTF=%dC (expect 50/60/80)\n", otc_val, otd_val, otf_val);
 
   delay(50);
 
