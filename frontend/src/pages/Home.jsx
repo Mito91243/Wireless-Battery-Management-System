@@ -235,35 +235,34 @@ export default function HomePage() {
 
 /* ----------------------------------------------------------------------------
    Animated architecture diagram — fan-in topology:
-     4 wireless slave nodes -> 1 master hub -> dashboard.
-   Cyan packets stream live data from each slave into the master, then on to the
-   dashboard. Pure inline SVG + SMIL + CSS keyframes: no build/animation config.
+     3 wireless slave nodes -> 1 master hub -> users.
+   Each slave shows a battery charging/discharging; cyan packets stream along the
+   curved links into the master, then on to the users. Pure inline SVG + SMIL.
 ---------------------------------------------------------------------------- */
 function NetworkAnimation() {
-  const SLAVE_W = 92;
-  const SLAVE_H = 64;
-  const MASTER_W = 108;
-  const MASTER_H = 108;
-  const DASH_W = 100;
-  const DASH_H = 88;
+  const SLAVE_W = 88;
+  const SLAVE_H = 72;
+  const MASTER_W = 104;
+  const MASTER_H = 104;
+  const USER_W = 96;
+  const USER_H = 88;
 
-  // Four slaves stacked on the left, master centered, dashboard on the right.
+  // Three slaves stacked on the left, master centered, users on the right.
   const slaves = [
-    { cy: 56 },
-    { cy: 146 },
-    { cy: 236 },
-    { cy: 326 },
-  ].map((s, i) => ({ ...s, id: `slave${i}`, cx: 76, label: `SLAVE ${i + 1}`, sub: "ESP32" }));
+    { cy: 66 },
+    { cy: 182 },
+    { cy: 298 },
+  ].map((s, i) => ({ ...s, id: `slave${i}`, cx: 82, label: `SLAVE ${i + 1}` }));
   const masterCx = 372;
-  const masterCy = 191;
-  const dashCx = 624;
-  const dashCy = 191;
+  const masterCy = 182;
+  const userCx = 620;
+  const userCy = 182;
 
   // Edge anchor points for the converging links.
   const slaveOut = (s) => ({ x: s.cx + SLAVE_W / 2, y: s.cy });
   const masterIn = { x: masterCx - MASTER_W / 2, y: masterCy };
   const masterOut = { x: masterCx + MASTER_W / 2, y: masterCy };
-  const dashIn = { x: dashCx - DASH_W / 2, y: dashCy };
+  const userIn = { x: userCx - USER_W / 2, y: userCy };
 
   return (
     <div className="mx-auto w-full max-w-[560px] animate-[float_6s_ease-in-out_infinite]">
@@ -271,10 +270,10 @@ function NetworkAnimation() {
         @keyframes float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-10px); } }
       `}</style>
       <svg
-        viewBox="0 0 700 382"
+        viewBox="0 0 700 380"
         className="w-full h-auto"
         role="img"
-        aria-label="Animated diagram of the wireless battery management system: four wireless slave ESP32 nodes streaming live data into a single master ESP32 hub, which forwards it to a user dashboard."
+        aria-label="Animated diagram of the wireless battery management system: three wireless slave nodes, each monitoring a charging battery, streaming live data into a single master hub, which forwards it to the users."
       >
         <defs>
           <linearGradient id="nodeFill" x1="0" y1="0" x2="0" y2="1">
@@ -297,73 +296,62 @@ function NetworkAnimation() {
           </filter>
         </defs>
 
-        {/* Links: slave -> master (converging) and master -> dashboard. */}
+        {/* Links: slave -> master (curved, converging) and master -> users. */}
         {slaves.map((s, i) => {
           const a = slaveOut(s);
-          const path = `M ${a.x} ${a.y} L ${masterIn.x} ${masterIn.y}`;
+          const cx1 = (a.x + masterIn.x) / 2;
+          const path = `M ${a.x} ${a.y} C ${cx1} ${a.y}, ${cx1} ${masterIn.y}, ${masterIn.x} ${masterIn.y}`;
           return (
             <g key={`link-${i}`}>
-              <line x1={a.x} y1={a.y} x2={masterIn.x} y2={masterIn.y} stroke="#cbd5e1" strokeWidth="1.5" />
+              <path d={path} fill="none" stroke="#cbd5e1" strokeWidth="1.5" />
               <circle r="4.5" fill="#0ea5e9" filter="url(#glow)">
-                <animateMotion dur="3.4s" begin={`${i * 0.55}s`} repeatCount="indefinite" path={path} />
+                <animateMotion dur="2.8s" begin={`${i * 0.45}s`} repeatCount="indefinite" path={path} />
               </circle>
             </g>
           );
         })}
         {(() => {
-          const path = `M ${masterOut.x} ${masterOut.y} L ${dashIn.x} ${dashIn.y}`;
+          const path = `M ${masterOut.x} ${masterOut.y} L ${userIn.x} ${userIn.y}`;
           return (
-            <g key="link-dash">
-              <line x1={masterOut.x} y1={masterOut.y} x2={dashIn.x} y2={dashIn.y} stroke="#cbd5e1" strokeWidth="1.5" />
-              {[0, 1.7].map((delay, j) => (
+            <g key="link-user">
+              <path d={path} fill="none" stroke="#cbd5e1" strokeWidth="1.5" />
+              {[0, 1.4].map((delay, j) => (
                 <circle key={j} r="4.5" fill="#0ea5e9" filter="url(#glow)">
-                  <animateMotion dur="3.4s" begin={`${delay}s`} repeatCount="indefinite" path={path} />
+                  <animateMotion dur="2.8s" begin={`${delay}s`} repeatCount="indefinite" path={path} />
                 </circle>
               ))}
             </g>
           );
         })()}
 
-        {/* Slave nodes */}
-        {slaves.map((s) => {
+        {/* Slave nodes — battery icon inside, label below */}
+        {slaves.map((s, i) => {
           const x = s.cx - SLAVE_W / 2;
           const top = s.cy - SLAVE_H / 2;
           return (
             <g key={s.id}>
-              <rect x={x} y={top} width={SLAVE_W} height={SLAVE_H} rx="13" fill="url(#nodeFill)" stroke="#d3dbe6" strokeWidth="1.4" filter="url(#soft)" />
-              <circle cx={x + SLAVE_W - 12} cy={top + 12} r="3" fill="#22c55e">
-                <animate attributeName="opacity" values="1;0.25;1" dur="1.6s" begin={`${s.cy * 0.004}s`} repeatCount="indefinite" />
-              </circle>
-              <Glyph id="slave" cx={s.cx - 22} cy={s.cy} />
-              <text x={s.cx + 6} y={s.cy - 3} textAnchor="middle" fontSize="12" fontWeight="700" fill="#0f172a" fontFamily="ui-sans-serif, system-ui">{s.label}</text>
-              <text x={s.cx + 6} y={s.cy + 11} textAnchor="middle" fontSize="8.5" fontWeight="500" fill="#94a3b8" fontFamily="ui-sans-serif, system-ui">{s.sub}</text>
+              <rect x={x} y={top} width={SLAVE_W} height={SLAVE_H} rx="14" fill="url(#nodeFill)" stroke="#d3dbe6" strokeWidth="1.4" filter="url(#soft)" />
+              <Glyph id="battery" cx={s.cx} cy={s.cy} delay={i * 0.7} />
+              <text x={s.cx} y={s.cy + SLAVE_H / 2 + 17} textAnchor="middle" fontSize="13" fontWeight="700" fill="#0f172a" fontFamily="ui-sans-serif, system-ui">{s.label}</text>
             </g>
           );
         })}
 
-        {/* Master hub */}
+        {/* Master hub — wifi icon inside, label below */}
         <g>
-          <circle cx={masterCx} cy={masterCy} r="60" fill="url(#hubGlow)">
-            <animate attributeName="r" values="50;64;50" dur="3s" repeatCount="indefinite" />
+          <circle cx={masterCx} cy={masterCy} r="58" fill="url(#hubGlow)">
+            <animate attributeName="r" values="48;62;48" dur="3s" repeatCount="indefinite" />
           </circle>
-          <rect x={masterCx - MASTER_W / 2} y={masterCy - MASTER_H / 2} width={MASTER_W} height={MASTER_H} rx="15" fill="url(#nodeFill)" stroke="#0891b2" strokeWidth="2" filter="url(#soft)" />
-          <circle cx={masterCx + MASTER_W / 2 - 13} cy={masterCy - MASTER_H / 2 + 13} r="3" fill="#22c55e">
-            <animate attributeName="opacity" values="1;0.25;1" dur="1.6s" repeatCount="indefinite" />
-          </circle>
-          <Glyph id="master" cx={masterCx} cy={masterCy - 8} />
-          <text x={masterCx} y={masterCy + 25} textAnchor="middle" fontSize="12" fontWeight="700" fill="#0f172a" fontFamily="ui-sans-serif, system-ui">MASTER</text>
-          <text x={masterCx} y={masterCy + 38} textAnchor="middle" fontSize="8.5" fontWeight="500" fill="#94a3b8" fontFamily="ui-sans-serif, system-ui">ESP32 hub</text>
+          <rect x={masterCx - MASTER_W / 2} y={masterCy - MASTER_H / 2} width={MASTER_W} height={MASTER_H} rx="16" fill="url(#nodeFill)" stroke="#0891b2" strokeWidth="2" filter="url(#soft)" />
+          <Glyph id="master" cx={masterCx} cy={masterCy} />
+          <text x={masterCx} y={masterCy + MASTER_H / 2 + 19} textAnchor="middle" fontSize="13" fontWeight="700" fill="#0f172a" fontFamily="ui-sans-serif, system-ui">MASTER</text>
         </g>
 
-        {/* Dashboard */}
+        {/* Users — screen icon inside, label below */}
         <g>
-          <rect x={dashCx - DASH_W / 2} y={dashCy - DASH_H / 2} width={DASH_W} height={DASH_H} rx="15" fill="url(#nodeFill)" stroke="#d3dbe6" strokeWidth="1.4" filter="url(#soft)" />
-          <circle cx={dashCx + DASH_W / 2 - 13} cy={dashCy - DASH_H / 2 + 13} r="3" fill="#22c55e">
-            <animate attributeName="opacity" values="1;0.25;1" dur="1.6s" begin="0.4s" repeatCount="indefinite" />
-          </circle>
-          <Glyph id="dash" cx={dashCx} cy={dashCy - 6} />
-          <text x={dashCx} y={dashCy + 24} textAnchor="middle" fontSize="12" fontWeight="700" fill="#0f172a" fontFamily="ui-sans-serif, system-ui">DASHBOARD</text>
-          <text x={dashCx} y={dashCy + 37} textAnchor="middle" fontSize="8.5" fontWeight="500" fill="#94a3b8" fontFamily="ui-sans-serif, system-ui">Users</text>
+          <rect x={userCx - USER_W / 2} y={userCy - USER_H / 2} width={USER_W} height={USER_H} rx="16" fill="url(#nodeFill)" stroke="#d3dbe6" strokeWidth="1.4" filter="url(#soft)" />
+          <Glyph id="users" cx={userCx} cy={userCy} />
+          <text x={userCx} y={userCy + USER_H / 2 + 19} textAnchor="middle" fontSize="13" fontWeight="700" fill="#0f172a" fontFamily="ui-sans-serif, system-ui">USERS</text>
         </g>
       </svg>
     </div>
@@ -371,20 +359,16 @@ function NetworkAnimation() {
 }
 
 /* Per-stage monoline icon, centered at (cx, cy). */
-function Glyph({ id, cx, cy }) {
-  if (id === "slave") {
+function Glyph({ id, cx, cy, delay = 0 }) {
+  if (id === "battery") {
+    // Battery whose charge level animates up and down (charge/discharge).
     return (
-      <g fill="none" stroke="#0ea5e9" strokeWidth="2" strokeLinecap="round">
-        <rect x={cx - 13} y={cy - 13} width="26" height="26" rx="4" fill="#ffffff" />
-        <circle cx={cx} cy={cy} r="4" fill="#0ea5e9" stroke="none" />
-        {[-7, 0, 7].map((o) => (
-          <g key={o}>
-            <line x1={cx + o} y1={cy - 13} x2={cx + o} y2={cy - 17} />
-            <line x1={cx + o} y1={cy + 13} x2={cx + o} y2={cy + 17} />
-            <line x1={cx - 13} y1={cy + o} x2={cx - 17} y2={cy + o} />
-            <line x1={cx + 13} y1={cy + o} x2={cx + 17} y2={cy + o} />
-          </g>
-        ))}
+      <g>
+        <rect x={cx - 20} y={cy - 12} width="36" height="24" rx="4" fill="none" stroke="#0ea5e9" strokeWidth="2.4" />
+        <rect x={cx + 16} y={cy - 6} width="5" height="12" rx="1.5" fill="#0ea5e9" />
+        <rect x={cx - 16} y={cy - 8} width="16" height="16" rx="1.5" fill="#0ea5e9">
+          <animate attributeName="width" values="4;28;4" dur="3s" begin={`${delay}s`} repeatCount="indefinite" />
+        </rect>
       </g>
     );
   }
@@ -398,7 +382,7 @@ function Glyph({ id, cx, cy }) {
       </g>
     );
   }
-  // dashboard
+  // users — screen with bar chart
   return (
     <g fill="none" stroke="#10b981" strokeWidth="2" strokeLinecap="round">
       <rect x={cx - 16} y={cy - 12} width="32" height="22" rx="2" fill="#ffffff" />
