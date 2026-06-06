@@ -73,15 +73,7 @@ export default function HomePage() {
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-12 lg:gap-10 items-center">
             {/* Left - Copy */}
             <div className="text-center lg:text-left">
-              <span className="inline-flex items-center gap-2 rounded-full border border-blue-200 bg-blue-50 px-4 py-1.5 text-xs sm:text-sm font-medium text-blue-700">
-                <span className="relative flex h-2 w-2">
-                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-cyan-500 opacity-75" />
-                  <span className="relative inline-flex h-2 w-2 rounded-full bg-cyan-500" />
-                </span>
-                Graduation Project
-              </span>
-
-              <h1 className="mt-6 text-4xl sm:text-5xl lg:text-6xl font-bold tracking-tight leading-[1.1] text-gray-900 break-words">
+              <h1 className="text-4xl sm:text-5xl lg:text-6xl font-bold tracking-tight leading-[1.1] text-gray-900 break-words">
                 Wireless{" "}
                 <span className="bg-gradient-to-r from-blue-600 via-cyan-500 to-blue-500 bg-clip-text text-transparent">
                   Battery Management
@@ -242,200 +234,194 @@ export default function HomePage() {
 }
 
 /* ----------------------------------------------------------------------------
-   Animated network diagram:  Slave nodes  ->  Master controller  ->  Users
-   Pure inline SVG + SMIL (animateMotion) so it works with the Tailwind CDN
-   without any build config, and scales perfectly on mobile.
+   Animated architecture diagram — the full two-way pipeline:
+     Battery (BQ76952) -> Slave ESP32 -> Master ESP32 -> Cloud (MQTT + DB) -> Dashboard
+   Cyan packets carry live telemetry UP the chain; amber packets carry control
+   commands BACK DOWN — so the graphic shows the system is bidirectional.
+   Pure inline SVG + SMIL + CSS keyframes: no build/animation config, scales on mobile.
 ---------------------------------------------------------------------------- */
 function NetworkAnimation() {
-  // Slave node vertical positions (box top-left y); shared geometry.
-  const slaves = [
-    { y: 30, label: "SLAVE 1", masterY: 168 },
-    { y: 148, label: "SLAVE 2", masterY: 190 },
-    { y: 266, label: "SLAVE 3", masterY: 212 },
+  const NODE_W = 104;
+  const NODE_H = 104;
+  const CY = 118; // vertical center of the node row
+  const TOP = CY - NODE_H / 2; // 66
+  // Five stages, evenly spaced left -> right.
+  const stages = [
+    { id: "pack", cx: 80, label: "BATTERY", sub: "BQ76952" },
+    { id: "slave", cx: 232, label: "SLAVE", sub: "ESP32" },
+    { id: "master", cx: 384, label: "MASTER", sub: "ESP32 hub" },
+    { id: "cloud", cx: 536, label: "CLOUD", sub: "MQTT · DB" },
+    { id: "dash", cx: 688, label: "DASHBOARD", sub: "Users" },
   ];
+  const protocols = ["I2C", "ESP-NOW", "MQTT", "HTTPS"];
 
   return (
-    <div className="mx-auto w-full max-w-[520px] animate-[float_6s_ease-in-out_infinite]">
+    <div className="mx-auto w-full max-w-[560px] animate-[float_6s_ease-in-out_infinite]">
       <style>{`
-        @keyframes float {
-          0%, 100% { transform: translateY(0); }
-          50% { transform: translateY(-10px); }
-        }
+        @keyframes float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-10px); } }
+        @keyframes dashflow { to { stroke-dashoffset: -16; } }
       `}</style>
       <svg
-        viewBox="0 0 480 380"
+        viewBox="0 0 768 250"
         className="w-full h-auto"
         role="img"
-        aria-label="Animation of wireless slave nodes sending data packets to a master controller, which forwards them to users"
+        aria-label="Animated diagram of the wireless battery management system: a battery pack, a slave ESP32, a master ESP32, a cloud with an MQTT broker and database, and a user dashboard. Cyan packets show telemetry flowing up to the cloud; amber packets show control commands flowing back down to the pack."
       >
         <defs>
-          <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
-            <feGaussianBlur stdDeviation="3" result="b" />
+          <linearGradient id="nodeFill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#ffffff" />
+            <stop offset="100%" stopColor="#eef2f7" />
+          </linearGradient>
+          <radialGradient id="hubGlow" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stopColor="#06b6d4" stopOpacity="0.25" />
+            <stop offset="100%" stopColor="#06b6d4" stopOpacity="0" />
+          </radialGradient>
+          <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+            <feDropShadow dx="0" dy="4" stdDeviation="5" floodColor="#1e3a8a" floodOpacity="0.12" />
+          </filter>
+          <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+            <feGaussianBlur stdDeviation="2.4" result="b" />
             <feMerge>
               <feMergeNode in="b" />
               <feMergeNode in="SourceGraphic" />
             </feMerge>
           </filter>
-          <linearGradient id="nodeFill" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#ffffff" stopOpacity="1" />
-            <stop offset="100%" stopColor="#eef2f7" stopOpacity="1" />
-          </linearGradient>
-          <radialGradient id="masterGlow" cx="50%" cy="50%" r="50%">
-            <stop offset="0%" stopColor="#06b6d4" stopOpacity="0.22" />
-            <stop offset="100%" stopColor="#06b6d4" stopOpacity="0" />
-          </radialGradient>
-          <filter id="nodeShadow" x="-30%" y="-30%" width="160%" height="160%">
-            <feDropShadow dx="0" dy="4" stdDeviation="5" floodColor="#1e3a8a" floodOpacity="0.12" />
-          </filter>
         </defs>
 
-        {/* Connection lines */}
-        {slaves.map((s, i) => {
-          const startY = s.y + 35;
+        {/* Links: protocol tag + two-way animated packets for each hop */}
+        {stages.slice(0, -1).map((s, i) => {
+          const ax = s.cx + NODE_W / 2;
+          const bx = stages[i + 1].cx - NODE_W / 2;
+          const midX = (ax + bx) / 2;
+          const dataY = CY - 7;
+          const cmdY = CY + 7;
+          const dataPath = `M ${ax} ${dataY} L ${bx} ${dataY}`;
+          const cmdPath = `M ${bx} ${cmdY} L ${ax} ${cmdY}`;
           return (
-            <path
-              key={`line-${i}`}
-              d={`M118,${startY} C168,${startY} 178,${s.masterY} 214,${s.masterY}`}
-              fill="none"
-              stroke="rgba(100,116,139,0.45)"
-              strokeWidth="1.5"
-            />
+            <g key={`link-${i}`}>
+              <line x1={ax} y1={dataY} x2={bx} y2={dataY} stroke="#cbd5e1" strokeWidth="1.5" strokeDasharray="2 4" style={{ animation: "dashflow 1s linear infinite" }} />
+              <line x1={ax} y1={cmdY} x2={bx} y2={cmdY} stroke="#fed7aa" strokeWidth="1.5" strokeDasharray="2 4" style={{ animation: "dashflow 1.4s linear infinite reverse" }} />
+              <path d={`M ${bx - 5} ${dataY - 3} L ${bx} ${dataY} L ${bx - 5} ${dataY + 3}`} fill="none" stroke="#0ea5e9" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              <path d={`M ${ax + 5} ${cmdY - 3} L ${ax} ${cmdY} L ${ax + 5} ${cmdY + 3}`} fill="none" stroke="#f59e0b" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              <g transform={`translate(${midX} ${CY - 30})`}>
+                <rect x="-23" y="-9" width="46" height="18" rx="9" fill="#ffffff" stroke="#e2e8f0" />
+                <text x="0" y="3.5" textAnchor="middle" fontSize="9.5" fontWeight="700" fill="#475569" fontFamily="ui-sans-serif, system-ui">{protocols[i]}</text>
+              </g>
+              {[0, 0.9].map((delay, j) => (
+                <circle key={`d-${j}`} r="3.4" fill="#0ea5e9" filter="url(#glow)">
+                  <animateMotion dur="1.8s" begin={`${i * 0.22 + delay}s`} repeatCount="indefinite" path={dataPath} />
+                </circle>
+              ))}
+              {[0.45, 1.35].map((delay, j) => (
+                <circle key={`c-${j}`} r="3.4" fill="#f59e0b" filter="url(#glow)">
+                  <animateMotion dur="1.8s" begin={`${i * 0.22 + delay}s`} repeatCount="indefinite" path={cmdPath} />
+                </circle>
+              ))}
+            </g>
           );
         })}
-        <path
-          d="M312,190 L372,190"
-          fill="none"
-          stroke="rgba(100,116,139,0.45)"
-          strokeWidth="1.5"
-        />
 
-        {/* Packets: slaves -> master (sky blue) */}
-        {slaves.map((s, i) => {
-          const startY = s.y + 35;
-          const d = `M118,${startY} C168,${startY} 178,${s.masterY} 214,${s.masterY}`;
-          return [0, 1.1].map((delay, j) => (
-            <circle key={`pk-${i}-${j}`} r="4.5" fill="#0ea5e9" filter="url(#glow)">
-              <animateMotion
-                dur="2.2s"
-                begin={`${i * 0.4 + delay}s`}
-                repeatCount="indefinite"
-                path={d}
-                keyPoints="0;1"
-                keyTimes="0;1"
-                calcMode="spline"
-                keySplines="0.4 0 0.4 1"
-              />
-              <animate
-                attributeName="opacity"
-                values="0;1;1;0"
-                keyTimes="0;0.1;0.85;1"
-                dur="2.2s"
-                begin={`${i * 0.4 + delay}s`}
-                repeatCount="indefinite"
-              />
-            </circle>
-          ));
+        {/* Nodes */}
+        {stages.map((s) => {
+          const x = s.cx - NODE_W / 2;
+          const isMaster = s.id === "master";
+          return (
+            <g key={s.id}>
+              {isMaster && (
+                <circle cx={s.cx} cy={CY} r="60" fill="url(#hubGlow)">
+                  <animate attributeName="r" values="50;64;50" dur="3s" repeatCount="indefinite" />
+                </circle>
+              )}
+              <rect x={x} y={TOP} width={NODE_W} height={NODE_H} rx="15" fill="url(#nodeFill)" stroke={isMaster ? "#0891b2" : "#d3dbe6"} strokeWidth={isMaster ? 2 : 1.4} filter="url(#soft)" />
+              <circle cx={x + NODE_W - 13} cy={TOP + 13} r="3" fill="#22c55e">
+                <animate attributeName="opacity" values="1;0.25;1" dur="1.6s" begin={`${s.cx * 0.002}s`} repeatCount="indefinite" />
+              </circle>
+              <Glyph id={s.id} cx={s.cx} cy={CY - 8} />
+              <text x={s.cx} y={CY + 25} textAnchor="middle" fontSize="12" fontWeight="700" fill="#0f172a" fontFamily="ui-sans-serif, system-ui">{s.label}</text>
+              <text x={s.cx} y={CY + 38} textAnchor="middle" fontSize="8.5" fontWeight="500" fill="#94a3b8" fontFamily="ui-sans-serif, system-ui">{s.sub}</text>
+            </g>
+          );
         })}
 
-        {/* Packets: master -> users (emerald) */}
-        {[0, 0.9, 1.8].map((delay, i) => (
-          <circle key={`mu-${i}`} r="4.5" fill="#10b981" filter="url(#glow)">
-            <animateMotion
-              dur="1.6s"
-              begin={`${delay}s`}
-              repeatCount="indefinite"
-              path="M312,190 L372,190"
-            />
-            <animate
-              attributeName="opacity"
-              values="0;1;1;0"
-              keyTimes="0;0.15;0.8;1"
-              dur="1.6s"
-              begin={`${delay}s`}
-              repeatCount="indefinite"
-            />
-          </circle>
-        ))}
-
-        {/* Slave nodes */}
-        {slaves.map((s, i) => (
-          <g key={`slave-${i}`}>
-            <rect
-              x="22"
-              y={s.y}
-              width="96"
-              height="70"
-              rx="14"
-              fill="url(#nodeFill)"
-              stroke="#0ea5e9"
-              strokeWidth="1.5"
-              filter="url(#nodeShadow)"
-            />
-            {/* battery glyph */}
-            <rect x="44" y={s.y + 18} width="40" height="20" rx="3" fill="none" stroke="#0ea5e9" strokeWidth="2" />
-            <rect x="84" y={s.y + 23} width="4" height="10" rx="1" fill="#0ea5e9" />
-            <rect x="47" y={s.y + 21} width="22" height="14" rx="1" fill="#0ea5e9">
-              <animate
-                attributeName="width"
-                values="8;30;8"
-                dur="3s"
-                begin={`${i * 0.5}s`}
-                repeatCount="indefinite"
-              />
-            </rect>
-            <text x="70" y={s.y + 56} textAnchor="middle" fill="#475569" fontSize="11" fontWeight="600" fontFamily="ui-sans-serif, system-ui">
-              {s.label}
-            </text>
+        {/* Legend — makes the two-way flow explicit */}
+        <g fontFamily="ui-sans-serif, system-ui">
+          <g transform="translate(238 222)">
+            <circle cx="0" cy="0" r="4" fill="#0ea5e9" />
+            <text x="11" y="3.5" fontSize="10.5" fontWeight="600" fill="#475569">Telemetry →</text>
           </g>
-        ))}
-
-        {/* Master controller */}
-        <circle cx="263" cy="190" r="70" fill="url(#masterGlow)">
-          <animate attributeName="r" values="58;74;58" dur="3s" repeatCount="indefinite" />
-        </circle>
-        <rect
-          x="214"
-          y="150"
-          width="98"
-          height="80"
-          rx="16"
-          fill="url(#nodeFill)"
-          stroke="#0891b2"
-          strokeWidth="2"
-          filter="url(#nodeShadow)"
-        />
-        {/* wifi / broadcast arcs */}
-        <g stroke="#0891b2" strokeWidth="2.5" fill="none" strokeLinecap="round">
-          <path d="M250,182 a18,18 0 0 1 26,0" />
-          <path d="M244,176 a26,26 0 0 1 38,0" />
-          <circle cx="263" cy="188" r="3" fill="#0891b2" stroke="none" />
-        </g>
-        <text x="263" y="216" textAnchor="middle" fill="#0f172a" fontSize="12" fontWeight="700" fontFamily="ui-sans-serif, system-ui">
-          MASTER
-        </text>
-
-        {/* Users / dashboard */}
-        <g>
-          <rect
-            x="372"
-            y="152"
-            width="86"
-            height="76"
-            rx="14"
-            fill="url(#nodeFill)"
-            stroke="#10b981"
-            strokeWidth="1.5"
-            filter="url(#nodeShadow)"
-          />
-          {/* monitor glyph */}
-          <rect x="392" y="166" width="46" height="30" rx="3" fill="none" stroke="#10b981" strokeWidth="2" />
-          <line x1="415" y1="196" x2="415" y2="204" stroke="#10b981" strokeWidth="2" />
-          <line x1="405" y1="204" x2="425" y2="204" stroke="#10b981" strokeWidth="2" strokeLinecap="round" />
-          <text x="415" y="220" textAnchor="middle" fill="#475569" fontSize="11" fontWeight="600" fontFamily="ui-sans-serif, system-ui">
-            USERS
-          </text>
+          <g transform="translate(430 222)">
+            <circle cx="0" cy="0" r="4" fill="#f59e0b" />
+            <text x="11" y="3.5" fontSize="10.5" fontWeight="600" fill="#475569">← Commands</text>
+          </g>
         </g>
       </svg>
     </div>
+  );
+}
+
+/* Per-stage monoline icon, centered at (cx, cy). */
+function Glyph({ id, cx, cy }) {
+  if (id === "pack") {
+    return (
+      <g>
+        <rect x={cx - 18} y={cy - 10} width="32" height="20" rx="3" fill="none" stroke="#0ea5e9" strokeWidth="2" />
+        <rect x={cx + 14} y={cy - 5} width="4" height="10" rx="1" fill="#0ea5e9" />
+        <rect x={cx - 15} y={cy - 7} width="14" height="14" rx="1" fill="#0ea5e9">
+          <animate attributeName="width" values="6;24;6" dur="3s" repeatCount="indefinite" />
+        </rect>
+      </g>
+    );
+  }
+  if (id === "slave") {
+    return (
+      <g fill="none" stroke="#0ea5e9" strokeWidth="2" strokeLinecap="round">
+        <rect x={cx - 13} y={cy - 13} width="26" height="26" rx="4" fill="#ffffff" />
+        <circle cx={cx} cy={cy} r="4" fill="#0ea5e9" stroke="none" />
+        {[-7, 0, 7].map((o) => (
+          <g key={o}>
+            <line x1={cx + o} y1={cy - 13} x2={cx + o} y2={cy - 17} />
+            <line x1={cx + o} y1={cy + 13} x2={cx + o} y2={cy + 17} />
+            <line x1={cx - 13} y1={cy + o} x2={cx - 17} y2={cy + o} />
+            <line x1={cx + 13} y1={cy + o} x2={cx + 17} y2={cy + o} />
+          </g>
+        ))}
+      </g>
+    );
+  }
+  if (id === "master") {
+    return (
+      <g fill="none" stroke="#0891b2" strokeWidth="2.4" strokeLinecap="round">
+        <path d={`M ${cx - 9} ${cy + 3} a 9 9 0 0 1 18 0`} />
+        <path d={`M ${cx - 15} ${cy - 2} a 15 15 0 0 1 30 0`} />
+        <path d={`M ${cx - 21} ${cy - 7} a 21 21 0 0 1 42 0`} opacity="0.45" />
+        <circle cx={cx} cy={cy + 7} r="3" fill="#0891b2" stroke="none" />
+      </g>
+    );
+  }
+  if (id === "cloud") {
+    return (
+      <g transform={`translate(${cx} ${cy})`}>
+        <path d="M -9 5 a 6 6 0 0 1 1 -11 a 8 8 0 0 1 15 -1 a 6 6 0 0 1 1 12 z" fill="#ffffff" stroke="#7c3aed" strokeWidth="2" strokeLinejoin="round" />
+        <g fill="#ffffff" stroke="#7c3aed" strokeWidth="1.7" transform="translate(0 11)">
+          <ellipse cx="0" cy="0" rx="8" ry="2.6" />
+          <path d="M -8 0 v 6 a 8 2.6 0 0 0 16 0 v -6" />
+          <ellipse cx="0" cy="0" rx="8" ry="2.6" fill="#ffffff" />
+        </g>
+      </g>
+    );
+  }
+  // dashboard
+  return (
+    <g fill="none" stroke="#10b981" strokeWidth="2" strokeLinecap="round">
+      <rect x={cx - 16} y={cy - 12} width="32" height="22" rx="2" fill="#ffffff" />
+      <line x1={cx} y1={cy + 10} x2={cx} y2={cy + 14} />
+      <line x1={cx - 7} y1={cy + 14} x2={cx + 7} y2={cy + 14} />
+      {[[-9, 5], [-2, 9], [5, 6]].map(([ox, h], k) => (
+        <rect key={k} x={cx + ox} y={cy + 4 - h} width="4" height={h} rx="1" fill="#10b981" stroke="none">
+          <animate attributeName="height" values={`${h};${h - 3};${h}`} dur="2s" begin={`${k * 0.3}s`} repeatCount="indefinite" />
+          <animate attributeName="y" values={`${cy + 4 - h};${cy + 4 - (h - 3)};${cy + 4 - h}`} dur="2s" begin={`${k * 0.3}s`} repeatCount="indefinite" />
+        </rect>
+      ))}
+    </g>
   );
 }

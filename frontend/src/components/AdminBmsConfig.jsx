@@ -115,6 +115,13 @@ export default function AdminBmsConfig({ packs = [] }) {
     } catch (e) { handleErr(e); }
   };
 
+  // Pull a fresh device snapshot when the FET tab opens. The AUTO/TEST mode and
+  // per-gate status below gate the manual toggles, so they must not be stale.
+  useEffect(() => {
+    if (subTab === 'fet') requestSnapshot();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subTab]);
+
   const saveProtection = () => {
     const args = {};
     for (const k of Object.keys(PROT_DEFAULTS)) args[k] = Number(prot[k]);
@@ -139,6 +146,25 @@ export default function AdminBmsConfig({ packs = [] }) {
   const neutral = btn('bg-gray-100 text-gray-800 hover:bg-gray-200 border border-gray-200');
   const danger = btn('bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100');
   const numInput = 'w-full px-2 py-1.5 border border-gray-200 rounded-md text-sm';
+
+  // --- FET state derived from the latest snapshot (mirrors the local AP) -------
+  // FET_EN set => AUTO (autonomous control; the BQ IGNORES manual gate toggles);
+  // FET_EN clear => TEST/manual, the only mode in which chg/dsg/pchg/pdsg toggles
+  // actually move a gate. This is why a toggle can report "applied" yet do nothing.
+  // Gate the per-gate toggles on it exactly like the slave's AP dashboard.
+  const fetMode = snapshot ? (snapshot.fetEn ? 'AUTO' : 'TEST') : null;
+  const inTestMode = snapshot?.fetEn === 0;
+  const fetBits = snapshot?.fetBits ?? 0;
+  const gate = {
+    chg: !!snapshot?.isCharging && !(fetBits & 1),
+    dsg: !!snapshot?.isDischarging && !(fetBits & 2),
+    pchg: !!(fetBits & 1),
+    pdsg: !!(fetBits & 2),
+  };
+  // FET commands change the state we gate on, so refresh the snapshot shortly after
+  // dispatch — the stored snapshot won't reflect the change until the device pushes
+  // a new one in response to a request.
+  const sendFetCmd = (action, opts = {}) => { sendCmd(action, {}, opts); setTimeout(requestSnapshot, 1600); };
 
   return (
     <div className="space-y-4">
@@ -233,19 +259,63 @@ export default function AdminBmsConfig({ packs = [] }) {
         )}
 
         {subTab === 'fet' && (
-          <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-5 space-y-3">
-            <h3 className="text-sm font-semibold text-gray-900">FET Control</h3>
-            <p className="text-xs text-gray-400">Individual toggles require Test Mode (FET master off). Verify state in the Live Snapshot — a lost command is not auto-retried.</p>
-            <div className="flex flex-wrap gap-2">
-              <button className={neutral} onClick={() => sendCmd('fetMasterToggle', {}, { confirm: 'Toggle FET master (AUTO/TEST mode)?' })}>FET Master Toggle</button>
-              <button className={neutral} onClick={() => sendCmd('chgTog', {}, { confirm: 'Toggle CHG FET?' })}>CHG Toggle</button>
-              <button className={neutral} onClick={() => sendCmd('dsgTog', {}, { confirm: 'Toggle DSG FET?' })}>DSG Toggle</button>
-              <button className={neutral} onClick={() => sendCmd('pchgTog', {}, { confirm: 'Toggle PCHG FET?' })}>PCHG Toggle</button>
-              <button className={neutral} onClick={() => sendCmd('pdsgTog', {}, { confirm: 'Toggle PDSG FET?' })}>PDSG Toggle</button>
+          <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-5 space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-gray-900">FET Control</h3>
+              <div className="flex items-center gap-2">
+                <span className={`px-2 py-0.5 rounded text-xs font-bold uppercase border ${
+                  fetMode === 'TEST' ? 'bg-blue-50 text-blue-700 border-blue-200'
+                  : fetMode === 'AUTO' ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                  : 'bg-gray-100 text-gray-400 border-gray-200'}`}>
+                  {fetMode ? `${fetMode} MODE` : 'MODE —'}
+                </span>
+                <button onClick={requestSnapshot} className="flex items-center gap-1 px-2 py-1 rounded-md text-xs bg-slate-800 text-white hover:bg-slate-700">
+                  <RefreshCw className="h-3 w-3" /> State
+                </button>
+              </div>
             </div>
-            <div className="flex flex-wrap gap-2 pt-1">
-              <button className={primary} onClick={() => sendCmd('allFetsOn', {}, { confirm: 'Turn ALL FETs ON (exit maintenance)?' })}>All FETs ON</button>
-              <button className={danger} onClick={() => sendCmd('allFetsOff', {}, { typed: 'OFF' })}>All FETs OFF</button>
+
+            {/* FET master switches AUTO <-> TEST. Manual gate toggles only apply in TEST. */}
+            <div className="flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2">
+              <div>
+                <div className="text-sm font-medium text-gray-800">FET Master (AUTO / TEST)</div>
+                <div className="text-xs text-gray-400">TEST mode unlocks the manual gate toggles below.</div>
+              </div>
+              <button className={neutral} onClick={() => sendFetCmd('fetMasterToggle', { confirm: 'Toggle FET master (AUTO/TEST mode)?' })}>FET Master Toggle</button>
+            </div>
+
+            {snapshot && !inTestMode && (
+              <div className="flex items-center gap-2 text-xs text-blue-700 bg-blue-50 border border-blue-200 rounded-lg px-3 py-2">
+                <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0" /> Pack is in AUTO mode — the BQ ignores manual gate toggles. Press <b>FET Master Toggle</b> to enter TEST mode first.
+              </div>
+            )}
+
+            {/* Individual gates — disabled unless TEST mode, mirroring the local AP. */}
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                ['chgTog', 'CHG Gate', gate.chg],
+                ['dsgTog', 'DSG Gate', gate.dsg],
+                ['pchgTog', 'PCHG Gate', gate.pchg],
+                ['pdsgTog', 'PDSG Gate', gate.pdsg],
+              ].map(([action, label, on]) => (
+                <div key={action} className="flex items-center justify-between border border-gray-200 rounded-lg px-3 py-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium text-gray-800">{label}</span>
+                    <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${on ? 'bg-emerald-100 text-emerald-700' : 'bg-gray-100 text-gray-500'}`}>{on ? 'ON' : 'OFF'}</span>
+                  </div>
+                  <button className={neutral} disabled={!inTestMode}
+                    onClick={() => sendFetCmd(action, { confirm: `Toggle ${label}?` })}>Toggle</button>
+                </div>
+              ))}
+            </div>
+
+            {/* Pin-driven bulk control — only effective on boards that route CFETOFF/DFETOFF. */}
+            <div className="pt-1">
+              <div className="flex flex-wrap gap-2">
+                <button className={primary} onClick={() => sendFetCmd('allFetsOn', { confirm: 'Turn ALL FETs ON (exit maintenance)?' })}>All FETs ON</button>
+                <button className={danger} onClick={() => sendFetCmd('allFetsOff', { typed: 'OFF' })}>All FETs OFF</button>
+              </div>
+              <p className="text-[11px] text-gray-400 mt-1">All-FETs uses the CFETOFF/DFETOFF override pins; on packs where those aren&apos;t wired it has no effect — use the gate toggles in TEST mode.</p>
             </div>
           </div>
         )}
@@ -341,7 +411,7 @@ function SnapshotView({ snapshot, snapAge, onRefresh }) {
             <Stat label="Power mode" value={PWR_MODES[s.pwr] ?? s.pwr} />
             <Stat label="Bal mode" value={['Auto', 'Host', 'Manual'][s.balMode] ?? s.balMode} />
             <Stat label="Bal master" value={s.balMaster ? 'On' : 'Off'} />
-            <Stat label="FET enable" value={s.fetEn ? 'TEST' : 'AUTO'} />
+            <Stat label="FET mode" value={s.fetEn ? 'AUTO' : 'TEST'} />
             <Stat label="SS A/B/C" value={`${s.ssA}/${s.ssB}/${s.ssC}`} />
             <Stat label="PF A/B/C/D" value={`${s.pfA}/${s.pfB}/${s.pfC}/${s.pfD}`} />
             <Stat label="Cell Δ" value={`${s.cellDelta ?? 0} mV`} />
