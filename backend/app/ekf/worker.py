@@ -13,7 +13,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import func
 
@@ -104,7 +104,7 @@ def _process_pack(db, pack: Pack) -> int:
     st.last_reading_id = rows[-1].id
     st.last_timestamp = last_ts
     st.state_json = json.dumps(ekf.dump_state())
-    st.updated_at = datetime.utcnow()
+    st.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
     db.commit()
     return len(rows)
 
