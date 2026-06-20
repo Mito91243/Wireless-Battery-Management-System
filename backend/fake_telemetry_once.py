@@ -24,7 +24,7 @@ if len(sys.argv) < 2:
 MASTER_PAIRING_CODE = sys.argv[1].strip().upper()
 SLAVE_PAIRING_CODE = os.getenv("SLAVE_PAIRING_CODE", "FAKE01")
 
-BROKER = os.getenv("MQTT_BROKER", "143.198.121.33")
+BROKER = os.getenv("MQTT_BROKER", "wbms.systems")
 PORT = int(os.getenv("MQTT_PORT", "1883"))
 USER = os.getenv("MQTT_USERNAME", "wbms-backend")
 PASS = os.getenv("MQTT_PASSWORD", "mito1234")

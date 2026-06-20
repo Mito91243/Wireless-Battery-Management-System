@@ -11,7 +11,7 @@ const char *const MASTER_AP_SSID = "WBMS-Node"; // Soft AP the slave scans to di
 const uint32_t WIFI_RETRY_INTERVAL_MS = 10000;  // master background reconnect check cadence
 
 // ==================== MQTT CONFIG ====================
-const char *const MQTT_BROKER = "143.198.121.33";
+const char *const MQTT_BROKER = "wbms.systems";
 const uint16_t MQTT_PORT = 1883;
 const char *const MQTT_TOPIC = "bms/data";
 const char *const MQTT_CLIENT_ID = "wbms-master";
